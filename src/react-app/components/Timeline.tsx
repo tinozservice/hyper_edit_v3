@@ -1,0 +1,373 @@
+import { useState, useRef, useCallback, useMemo } from 'react';
+import { ZoomIn, ZoomOut, Play, Pause, SkipBack } from 'lucide-react';
+import TimelineClip from './TimelineClip';
+import type { Track, TimelineClip as TimelineClipType, Asset } from '@/react-app/hooks/useProject';
+
+interface TimelineProps {
+  tracks: Track[];
+  clips: TimelineClipType[];
+  assets: Asset[];
+  selectedClipId: string | null;
+  currentTime: number;
+  duration: number;
+  isPlaying: boolean;
+  onSelectClip: (id: string | null) => void;
+  onTimeChange: (time: number) => void;
+  onPlayPause: () => void;
+  onStop: () => void;
+  onMoveClip: (clipId: string, newStart: number, newTrackId?: string) => void;
+  onResizeClip: (clipId: string, newInPoint: number, newOutPoint: number, newStart?: number) => void;
+  onDeleteClip: (clipId: string) => void;
+  onDropAsset: (asset: Asset, trackId: string, time: number) => void;
+  onSave: () => void;
+}
+
+const TRACK_HEIGHTS = {
+  video: 56,
+  audio: 44,
+};
+
+function formatTime(seconds: number): string {
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+export default function Timeline({
+  tracks,
+  clips,
+  assets,
+  selectedClipId,
+  currentTime,
+  duration,
+  isPlaying,
+  onSelectClip,
+  onTimeChange,
+  onPlayPause,
+  onStop,
+  onMoveClip,
+  onResizeClip,
+  onDeleteClip,
+  onDropAsset,
+  onSave,
+}: TimelineProps) {
+  const [zoom, setZoom] = useState(1);
+  const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
+  const [dragOverTrack, setDragOverTrack] = useState<string | null>(null);
+
+  const timelineRef = useRef<HTMLDivElement>(null);
+  const tracksContainerRef = useRef<HTMLDivElement>(null);
+
+  // Calculate display properties
+  const totalDuration = Math.max(duration, 10);
+  const basePixelsPerSecond = Math.min(100, 2000 / totalDuration);
+  const pixelsPerSecond = basePixelsPerSecond * zoom;
+  const timelineWidth = Math.max(totalDuration * pixelsPerSecond, 800);
+
+  // Track header width
+  const headerWidth = 48;
+
+  // Time ruler intervals
+  const getTimeInterval = useCallback(() => {
+    const effectiveZoom = pixelsPerSecond / 50;
+    if (effectiveZoom > 2) return 1;
+    if (effectiveZoom > 1) return 5;
+    if (effectiveZoom > 0.5) return 10;
+    if (effectiveZoom > 0.2) return 30;
+    return 60;
+  }, [pixelsPerSecond]);
+
+  const timeInterval = getTimeInterval();
+  const tickCount = Math.ceil(totalDuration / timeInterval) + 1;
+
+  // Sort tracks by order
+  const sortedTracks = useMemo(() =>
+    [...tracks].sort((a, b) => a.order - b.order),
+    [tracks]
+  );
+
+  // Get clips for a specific track
+  const getTrackClips = useCallback((trackId: string) =>
+    clips.filter(c => c.trackId === trackId),
+    [clips]
+  );
+
+  // Handle clicking on timeline to seek
+  const handleTimelineClick = useCallback((e: React.MouseEvent) => {
+    if (!tracksContainerRef.current) return;
+
+    const rect = tracksContainerRef.current.getBoundingClientRect();
+    const scrollLeft = tracksContainerRef.current.scrollLeft;
+    const clickX = e.clientX - rect.left + scrollLeft;
+    const newTime = Math.max(0, Math.min(clickX / pixelsPerSecond, duration));
+
+    onTimeChange(newTime);
+    onSelectClip(null);
+  }, [pixelsPerSecond, duration, onTimeChange, onSelectClip]);
+
+  // Handle playhead dragging
+  const handlePlayheadMouseDown = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    setIsDraggingPlayhead(true);
+  }, []);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!isDraggingPlayhead || !tracksContainerRef.current) return;
+
+    const rect = tracksContainerRef.current.getBoundingClientRect();
+    const scrollLeft = tracksContainerRef.current.scrollLeft;
+    const clickX = e.clientX - rect.left + scrollLeft;
+    const newTime = Math.max(0, Math.min(clickX / pixelsPerSecond, duration));
+
+    onTimeChange(newTime);
+  }, [isDraggingPlayhead, pixelsPerSecond, duration, onTimeChange]);
+
+  const handleMouseUp = useCallback(() => {
+    setIsDraggingPlayhead(false);
+  }, []);
+
+  // Handle drop from asset library
+  const handleDragOver = useCallback((e: React.DragEvent, trackId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOverTrack(trackId);
+  }, []);
+
+  const handleDragLeave = useCallback(() => {
+    setDragOverTrack(null);
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent, trackId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOverTrack(null);
+
+    const assetData = e.dataTransfer.getData('application/x-hyperedit-asset');
+    if (!assetData) return;
+
+    try {
+      const asset = JSON.parse(assetData) as Asset;
+
+      // Calculate drop time position
+      const rect = tracksContainerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+
+      const scrollLeft = tracksContainerRef.current?.scrollLeft || 0;
+      const dropX = e.clientX - rect.left + scrollLeft;
+      const dropTime = Math.max(0, dropX / pixelsPerSecond);
+
+      onDropAsset(asset, trackId, dropTime);
+    } catch (err) {
+      console.error('Failed to parse dropped asset:', err);
+    }
+  }, [pixelsPerSecond, onDropAsset]);
+
+  // Get asset for a clip
+  const getAssetForClip = useCallback((clip: TimelineClipType) =>
+    assets.find(a => a.id === clip.assetId),
+    [assets]
+  );
+
+  return (
+    <div
+      ref={timelineRef}
+      className="flex flex-col h-full select-none"
+      onMouseUp={handleMouseUp}
+      onMouseLeave={handleMouseUp}
+    >
+      {/* Timeline header */}
+      <div className="flex items-center justify-between px-3 py-2 bg-zinc-800/50 border-b border-zinc-700/50">
+        <div className="flex items-center gap-3">
+          {/* Playback controls */}
+          <div className="flex items-center gap-1">
+            <button
+              onClick={onStop}
+              className="p-1.5 bg-zinc-700 hover:bg-zinc-600 rounded transition-colors"
+              title="Stop (go to start)"
+            >
+              <SkipBack className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={onPlayPause}
+              className={`p-1.5 rounded transition-colors ${
+                isPlaying
+                  ? 'bg-orange-500 hover:bg-orange-600 text-white'
+                  : 'bg-zinc-700 hover:bg-zinc-600'
+              }`}
+              title={isPlaying ? 'Pause' : 'Play'}
+            >
+              {isPlaying ? (
+                <Pause className="w-3.5 h-3.5" />
+              ) : (
+                <Play className="w-3.5 h-3.5" />
+              )}
+            </button>
+          </div>
+
+          {/* Time display */}
+          <div className="flex items-center gap-2 text-xs">
+            <span className="font-mono text-orange-400">{formatTime(currentTime)}</span>
+            <span className="text-zinc-600">/</span>
+            <span className="font-mono text-zinc-400">{formatTime(duration)}</span>
+          </div>
+        </div>
+
+        {/* Zoom controls */}
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => setZoom(Math.max(0.25, zoom - 0.25))}
+            className="p-1.5 bg-zinc-700 hover:bg-zinc-600 rounded text-xs transition-colors"
+            title="Zoom out"
+          >
+            <ZoomOut className="w-3.5 h-3.5" />
+          </button>
+          <span className="text-xs text-zinc-400 w-12 text-center">{Math.round(zoom * 100)}%</span>
+          <button
+            onClick={() => setZoom(Math.min(4, zoom + 0.25))}
+            className="p-1.5 bg-zinc-700 hover:bg-zinc-600 rounded text-xs transition-colors"
+            title="Zoom in"
+          >
+            <ZoomIn className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+
+      {/* Timeline content */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Track headers (fixed) */}
+        <div
+          className="flex-shrink-0 bg-zinc-900/80 border-r border-zinc-700/50"
+          style={{ width: headerWidth }}
+        >
+          {/* Spacer for time ruler */}
+          <div className="h-6 border-b border-zinc-800" />
+
+          {/* Track labels */}
+          {sortedTracks.map(track => (
+            <div
+              key={track.id}
+              className="flex items-center justify-center text-xs font-medium text-zinc-400 border-b border-zinc-800/50"
+              style={{ height: TRACK_HEIGHTS[track.type] }}
+            >
+              {track.name}
+            </div>
+          ))}
+        </div>
+
+        {/* Scrollable tracks area */}
+        <div
+          ref={tracksContainerRef}
+          className="flex-1 overflow-auto"
+          onMouseMove={handleMouseMove}
+        >
+          <div
+            className="relative"
+            style={{ width: timelineWidth, minHeight: '100%' }}
+          >
+            {/* Time ruler */}
+            <div
+              className="sticky top-0 h-6 bg-zinc-900/95 border-b border-zinc-800 z-30"
+              onClick={handleTimelineClick}
+            >
+              {Array.from({ length: tickCount }).map((_, i) => {
+                const time = i * timeInterval;
+                if (time > totalDuration) return null;
+                return (
+                  <div
+                    key={i}
+                    className="absolute flex flex-col items-start"
+                    style={{ left: `${time * pixelsPerSecond}px` }}
+                  >
+                    <span className="text-[10px] text-zinc-500 pl-1">{formatTime(time)}</span>
+                    <div className="w-px h-2 bg-zinc-700" />
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Tracks */}
+            <div onClick={handleTimelineClick}>
+              {sortedTracks.map(track => {
+                const trackClips = getTrackClips(track.id);
+                const isDragOver = dragOverTrack === track.id;
+
+                return (
+                  <div
+                    key={track.id}
+                    className={`relative border-b border-zinc-800/50 ${
+                      isDragOver ? 'bg-orange-500/10' : 'bg-zinc-900/30'
+                    }`}
+                    style={{ height: TRACK_HEIGHTS[track.type] }}
+                    onDragOver={(e) => handleDragOver(e, track.id)}
+                    onDragLeave={handleDragLeave}
+                    onDrop={(e) => handleDrop(e, track.id)}
+                  >
+                    {/* Track background grid lines */}
+                    {Array.from({ length: tickCount }).map((_, i) => {
+                      const time = i * timeInterval;
+                      if (time > totalDuration) return null;
+                      return (
+                        <div
+                          key={i}
+                          className="absolute top-0 bottom-0 w-px bg-zinc-800/50"
+                          style={{ left: `${time * pixelsPerSecond}px` }}
+                        />
+                      );
+                    })}
+
+                    {/* Empty track placeholder */}
+                    {trackClips.length === 0 && !isDragOver && (
+                      <div className="absolute inset-0 flex items-center justify-center text-xs text-zinc-600 pointer-events-none">
+                        Drop clips here
+                      </div>
+                    )}
+
+                    {/* Drop indicator */}
+                    {isDragOver && (
+                      <div className="absolute inset-0 flex items-center justify-center text-xs text-orange-400 pointer-events-none border-2 border-dashed border-orange-500/50 rounded">
+                        Drop to add clip
+                      </div>
+                    )}
+
+                    {/* Clips */}
+                    {trackClips.map(clip => (
+                      <TimelineClip
+                        key={clip.id}
+                        clip={clip}
+                        asset={getAssetForClip(clip)}
+                        pixelsPerSecond={pixelsPerSecond}
+                        isSelected={selectedClipId === clip.id}
+                        trackHeight={TRACK_HEIGHTS[track.type]}
+                        onClick={() => onSelectClip(clip.id)}
+                        onMove={(newStart) => onMoveClip(clip.id, newStart)}
+                        onResize={(inPoint, outPoint, newStart) =>
+                          onResizeClip(clip.id, inPoint, outPoint, newStart)
+                        }
+                        onDelete={() => onDeleteClip(clip.id)}
+                        onDragEnd={onSave}
+                      />
+                    ))}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Playhead */}
+            <div
+              className="absolute top-0 bottom-0 w-0.5 bg-orange-500 z-40 pointer-events-none"
+              style={{ left: `${currentTime * pixelsPerSecond}px` }}
+            >
+              {/* Playhead handle */}
+              <div
+                className="absolute -top-0 -left-2.5 w-5 h-5 cursor-ew-resize pointer-events-auto"
+                onMouseDown={handlePlayheadMouseDown}
+              >
+                <div className="absolute top-0 left-1/2 -translate-x-1/2 w-0 h-0 border-l-[6px] border-r-[6px] border-t-[8px] border-l-transparent border-r-transparent border-t-orange-500" />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
