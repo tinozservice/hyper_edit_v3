@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { ZoomIn, ZoomOut, Play, Pause, SkipBack, Scissors, Trash2 } from 'lucide-react';
 import TimelineClip from './TimelineClip';
-import type { Track, TimelineClip as TimelineClipType, Asset } from '@/react-app/hooks/useProject';
+import type { Track, TimelineClip as TimelineClipType, Asset, CaptionData } from '@/react-app/hooks/useProject';
 
 interface TimelineProps {
   tracks: Track[];
@@ -21,11 +21,13 @@ interface TimelineProps {
   onCutAtPlayhead: () => void;
   onDropAsset: (asset: Asset, trackId: string, time: number) => void;
   onSave: () => void;
+  getCaptionData?: (clipId: string) => CaptionData | null;
 }
 
-const TRACK_HEIGHTS = {
+const TRACK_HEIGHTS: Record<string, number> = {
   video: 56,
   audio: 44,
+  text: 48,
 };
 
 function formatTime(seconds: number): string {
@@ -52,6 +54,7 @@ export default function Timeline({
   onCutAtPlayhead,
   onDropAsset,
   onSave,
+  getCaptionData,
 }: TimelineProps) {
   const [zoom, setZoom] = useState(1);
   const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
@@ -59,6 +62,21 @@ export default function Timeline({
 
   const timelineRef = useRef<HTMLDivElement>(null);
   const tracksContainerRef = useRef<HTMLDivElement>(null);
+  const trackHeadersRef = useRef<HTMLDivElement>(null);
+
+  // Sync vertical scroll between track headers and tracks content
+  useEffect(() => {
+    const tracksContainer = tracksContainerRef.current;
+    const trackHeaders = trackHeadersRef.current;
+    if (!tracksContainer || !trackHeaders) return;
+
+    const handleScroll = () => {
+      trackHeaders.scrollTop = tracksContainer.scrollTop;
+    };
+
+    tracksContainer.addEventListener('scroll', handleScroll);
+    return () => tracksContainer.removeEventListener('scroll', handleScroll);
+  }, []);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -273,24 +291,29 @@ export default function Timeline({
 
       {/* Timeline content */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Track headers (fixed) */}
+        {/* Track headers (fixed horizontally, syncs vertically) */}
         <div
-          className="flex-shrink-0 bg-zinc-900/80 border-r border-zinc-700/50"
+          className="flex-shrink-0 bg-zinc-900/80 border-r border-zinc-700/50 flex flex-col"
           style={{ width: headerWidth }}
         >
-          {/* Spacer for time ruler */}
-          <div className="h-6 border-b border-zinc-800" />
+          {/* Spacer for time ruler (sticky) */}
+          <div className="h-6 border-b border-zinc-800 flex-shrink-0" />
 
-          {/* Track labels */}
-          {sortedTracks.map(track => (
-            <div
-              key={track.id}
-              className="flex items-center justify-center text-xs font-medium text-zinc-400 border-b border-zinc-800/50"
-              style={{ height: TRACK_HEIGHTS[track.type] }}
-            >
-              {track.name}
-            </div>
-          ))}
+          {/* Track labels (scrolls vertically with tracks) */}
+          <div
+            ref={trackHeadersRef}
+            className="flex-1 overflow-hidden"
+          >
+            {sortedTracks.map(track => (
+              <div
+                key={track.id}
+                className="flex items-center justify-center text-xs font-medium text-zinc-400 border-b border-zinc-800/50"
+                style={{ height: TRACK_HEIGHTS[track.type] }}
+              >
+                {track.name}
+              </div>
+            ))}
+          </div>
         </div>
 
         {/* Scrollable tracks area */}
@@ -369,23 +392,34 @@ export default function Timeline({
                     )}
 
                     {/* Clips */}
-                    {trackClips.map(clip => (
-                      <TimelineClip
-                        key={clip.id}
-                        clip={clip}
-                        asset={getAssetForClip(clip)}
-                        pixelsPerSecond={pixelsPerSecond}
-                        isSelected={selectedClipId === clip.id}
-                        trackHeight={TRACK_HEIGHTS[track.type]}
-                        onClick={() => onSelectClip(clip.id)}
-                        onMove={(newStart) => onMoveClip(clip.id, newStart)}
-                        onResize={(inPoint, outPoint, newStart) =>
-                          onResizeClip(clip.id, inPoint, outPoint, newStart)
-                        }
-                        onDelete={() => onDeleteClip(clip.id)}
-                        onDragEnd={onSave}
-                      />
-                    ))}
+                    {trackClips.map(clip => {
+                      const captionData = getCaptionData?.(clip.id);
+                      const isCaption = track.type === 'text';
+                      const captionPreview = captionData?.words
+                        .slice(0, 5)
+                        .map(w => w.text)
+                        .join(' ') + (captionData && captionData.words.length > 5 ? '...' : '');
+
+                      return (
+                        <TimelineClip
+                          key={clip.id}
+                          clip={clip}
+                          asset={getAssetForClip(clip)}
+                          pixelsPerSecond={pixelsPerSecond}
+                          isSelected={selectedClipId === clip.id}
+                          trackHeight={TRACK_HEIGHTS[track.type]}
+                          onClick={() => onSelectClip(clip.id)}
+                          onMove={(newStart) => onMoveClip(clip.id, newStart)}
+                          onResize={(inPoint, outPoint, newStart) =>
+                            onResizeClip(clip.id, inPoint, outPoint, newStart)
+                          }
+                          onDelete={() => onDeleteClip(clip.id)}
+                          onDragEnd={onSave}
+                          isCaption={isCaption}
+                          captionPreview={captionPreview}
+                        />
+                      );
+                    })}
                   </div>
                 );
               })}

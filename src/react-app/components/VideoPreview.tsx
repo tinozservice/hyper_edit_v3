@@ -1,5 +1,7 @@
 import { Play, Image as ImageIcon, Layers, Move } from 'lucide-react';
 import { useRef, useEffect, forwardRef, useImperativeHandle, useMemo, useState, useCallback } from 'react';
+import CaptionRenderer from './CaptionRenderer';
+import type { CaptionWord, CaptionStyle } from '@/react-app/hooks/useProject';
 
 interface ClipTransform {
   x?: number;
@@ -16,10 +18,13 @@ interface ClipTransform {
 interface ClipLayer {
   id: string;
   url: string;
-  type: 'video' | 'image' | 'audio';
+  type: 'video' | 'image' | 'audio' | 'caption';
   trackId: string;
   clipTime: number;
   transform?: ClipTransform;
+  // Caption-specific data
+  captionWords?: CaptionWord[];
+  captionStyle?: CaptionStyle;
 }
 
 interface VideoPreviewProps {
@@ -87,13 +92,28 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
   const [dragStart, setDragStart] = useState<{ x: number; y: number; layerX: number; layerY: number } | null>(null);
 
   // Find the base video layer (V1) for audio/playback control
-  const baseVideoLayer = layers.find(l => l.trackId === 'V1' && l.type === 'video');
+  const foundBaseLayer = layers.find(l => l.trackId === 'V1' && l.type === 'video');
+  const baseLayerId = foundBaseLayer?.id;
+  const baseLayerUrl = foundBaseLayer?.url;
+  const baseLayerClipTime = foundBaseLayer?.clipTime;
 
-  // Get all layers sorted by track (V1 first, then V2, etc.) for rendering
-  const sortedLayers = useMemo(() =>
-    [...layers].sort((a, b) => a.trackId.localeCompare(b.trackId)),
-    [layers]
-  );
+  // Memoize to prevent effect triggers when only caption layers change
+  const baseVideoLayer = useMemo(() => {
+    return foundBaseLayer;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [baseLayerId, baseLayerUrl]);
+
+  // Get all layers sorted by track for rendering (V1 at bottom, then V2/V3, then T1 captions on top)
+  const sortedLayers = useMemo(() => {
+    const getTrackOrder = (trackId: string) => {
+      if (trackId === 'V1') return 0;
+      if (trackId === 'V2') return 1;
+      if (trackId === 'V3') return 2;
+      if (trackId.startsWith('T')) return 10; // Text/caption tracks on top
+      return 5; // Other tracks in between
+    };
+    return [...layers].sort((a, b) => getTrackOrder(a.trackId) - getTrackOrder(b.trackId));
+  }, [layers]);
 
   useImperativeHandle(ref, () => ({
     seekTo: (time: number) => {
@@ -102,34 +122,33 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
     getVideoElement: () => videoRef.current,
   }));
 
-  // Seek control for base video
+  // Seek control for base video (only when paused/scrubbing)
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !baseVideoLayer) return;
+    if (!video || baseLayerClipTime === undefined) return;
     if (isPlaying) return;
 
-    const target = baseVideoLayer.clipTime;
-    if (Math.abs(video.currentTime - target) > 0.1) {
-      video.currentTime = target;
+    if (Math.abs(video.currentTime - baseLayerClipTime) > 0.1) {
+      video.currentTime = baseLayerClipTime;
     }
-  }, [baseVideoLayer?.clipTime, isPlaying]);
+  }, [baseLayerClipTime, isPlaying]);
 
   // Play/pause control for base video
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !baseVideoLayer) return;
+    if (!video) return;
 
     if (isPlaying) {
       video.play().catch(() => {});
     } else {
       video.pause();
     }
-  }, [isPlaying, baseVideoLayer]);
+  }, [isPlaying]);
 
   // Seek on load
   const handleLoaded = () => {
-    if (videoRef.current && baseVideoLayer) {
-      videoRef.current.currentTime = baseVideoLayer.clipTime;
+    if (videoRef.current && baseLayerClipTime !== undefined) {
+      videoRef.current.currentTime = baseLayerClipTime;
     }
   };
 
@@ -193,34 +212,51 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
     );
   }
 
+  // Separate base video from overlay layers to prevent re-render issues
+  const overlayLayers = useMemo(() =>
+    sortedLayers.filter(l => !(l.trackId === 'V1' && l.type === 'video')),
+    [sortedLayers]
+  );
+
   return (
     <div
       ref={containerRef}
       className="relative w-full max-w-4xl aspect-video bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10"
     >
-      {/* Render all layers in order (V1 at bottom, V2+ on top) */}
-      {sortedLayers.map((layer, index) => {
-        const isBaseVideo = layer.trackId === 'V1' && layer.type === 'video';
+      {/* Base video layer (V1) - rendered separately for stability */}
+      {foundBaseLayer && (
+        <video
+          key="base-video"
+          ref={videoRef}
+          src={foundBaseLayer.url}
+          className="absolute inset-0 w-full h-full object-contain"
+          style={{ zIndex: 1 }}
+          playsInline
+          preload="auto"
+          onLoadedData={handleLoaded}
+        />
+      )}
+
+      {/* Render overlay layers (V2+, images, captions) */}
+      {overlayLayers.map((layer, index) => {
         const isOverlay = layer.trackId !== 'V1';
         const isDragging = draggingLayer === layer.id;
         const isSelected = selectedLayerId === layer.id;
-        const styles = getTransformStyles(layer.transform, index + 1, isDragging);
+        const styles = getTransformStyles(layer.transform, index + 2, isDragging);
 
         if (layer.type === 'video') {
           return (
             <video
               key={layer.id}
-              ref={isBaseVideo ? videoRef : undefined}
               src={layer.url}
-              className={`absolute inset-0 w-full h-full object-contain ${
-                isOverlay ? 'cursor-grab active:cursor-grabbing' : ''
-              } ${isSelected && isOverlay ? 'ring-2 ring-orange-500 ring-offset-2 ring-offset-black' : ''}`}
+              className={`absolute inset-0 w-full h-full object-contain cursor-grab active:cursor-grabbing ${
+                isSelected ? 'ring-2 ring-orange-500 ring-offset-2 ring-offset-black' : ''
+              }`}
               style={styles}
               playsInline
               preload="auto"
-              onLoadedData={isBaseVideo ? handleLoaded : undefined}
-              muted={!isBaseVideo}
-              onMouseDown={isOverlay ? (e) => handleLayerMouseDown(e, layer) : undefined}
+              muted
+              onMouseDown={(e) => handleLayerMouseDown(e, layer)}
             />
           );
         }
@@ -252,6 +288,17 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
                 </div>
               )}
             </div>
+          );
+        }
+
+        if (layer.type === 'caption' && layer.captionWords && layer.captionStyle) {
+          return (
+            <CaptionRenderer
+              key={layer.id}
+              words={layer.captionWords}
+              style={layer.captionStyle}
+              currentTime={layer.clipTime}
+            />
           );
         }
 

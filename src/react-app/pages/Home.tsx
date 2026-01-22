@@ -3,11 +3,12 @@ import VideoPreview, { VideoPreviewHandle } from '@/react-app/components/VideoPr
 import Timeline from '@/react-app/components/Timeline';
 import AssetLibrary from '@/react-app/components/AssetLibrary';
 import ClipPropertiesPanel from '@/react-app/components/ClipPropertiesPanel';
+import CaptionPropertiesPanel from '@/react-app/components/CaptionPropertiesPanel';
 import AIPromptPanel from '@/react-app/components/AIPromptPanel';
 import MotionGraphicsPanel from '@/react-app/components/MotionGraphicsPanel';
 import ResizablePanel from '@/react-app/components/ResizablePanel';
 import ResizableVerticalPanel from '@/react-app/components/ResizableVerticalPanel';
-import { useProject, Asset, TimelineClip } from '@/react-app/hooks/useProject';
+import { useProject, Asset, TimelineClip, CaptionStyle } from '@/react-app/hooks/useProject';
 import { useVideoSession } from '@/react-app/hooks/useVideoSession';
 import { Sparkles, Wand2, ListOrdered, Copy, Check, X, Download, Play } from 'lucide-react';
 import type { TemplateId } from '@/remotion/templates';
@@ -54,6 +55,12 @@ export default function Home() {
     saveProject,
     renderProject,
     getDuration,
+    // Captions
+    captionData,
+    addCaptionClip,
+    addCaptionClipsBatch,
+    updateCaptionStyle,
+    getCaptionData,
   } = useProject();
 
   // Use the legacy session hook for AI editing (single video operations)
@@ -90,11 +97,13 @@ export default function Home() {
     const layers: Array<{
       id: string;
       url: string;
-      type: 'video' | 'image' | 'audio';
+      type: 'video' | 'image' | 'audio' | 'caption';
       trackId: string;
       clipTime: number;
       clipStart: number;
       transform?: TimelineClip['transform'];
+      captionWords?: Array<{ text: string; start: number; end: number }>;
+      captionStyle?: CaptionStyle;
     }> = [];
 
     // Check video tracks (V1, V2, V3...)
@@ -126,8 +135,32 @@ export default function Home() {
       }
     }
 
+    // Check caption track (T1)
+    const captionClips = clips.filter(c =>
+      c.trackId === 'T1' &&
+      currentTime >= c.start &&
+      currentTime < c.start + c.duration
+    );
+
+    for (const clip of captionClips) {
+      const caption = getCaptionData(clip.id);
+      if (caption) {
+        const clipTime = currentTime - clip.start;
+        layers.push({
+          id: clip.id,
+          url: '',
+          type: 'caption',
+          trackId: clip.trackId,
+          clipTime,
+          clipStart: clip.start,
+          captionWords: caption.words,
+          captionStyle: caption.style,
+        });
+      }
+    }
+
     return layers;
-  }, [previewAssetId, assets, clips, currentTime, getAssetStreamUrl]);
+  }, [previewAssetId, assets, clips, currentTime, getAssetStreamUrl, getCaptionData]);
 
   const previewLayers = getPreviewLayers();
   const hasPreviewContent = previewLayers.length > 0;
@@ -312,6 +345,12 @@ export default function Home() {
     [selectedClip, assets]
   );
 
+  // Check if selected clip is a caption
+  const selectedCaptionData = useMemo(() =>
+    selectedClip && selectedClip.trackId === 'T1' ? getCaptionData(selectedClip.id) : null,
+    [selectedClip, getCaptionData]
+  );
+
   // Handle dragging overlay in video preview
   const handleLayerMove = useCallback((layerId: string, x: number, y: number) => {
     const clip = clips.find(c => c.id === layerId);
@@ -407,6 +446,111 @@ export default function Home() {
 
     return data;
   }, [session, assets, addClip, saveProject]);
+
+  // Handle transcribing video and adding captions
+  const handleTranscribeAndAddCaptions = useCallback(async (options?: { highlightColor?: string; fontFamily?: string }) => {
+    if (!session) {
+      throw new Error('No session available');
+    }
+
+    // Find the video asset to transcribe
+    const videoAsset = assets.find(a => a.type === 'video');
+
+    if (!videoAsset || videoAsset.type !== 'video') {
+      throw new Error('Please upload a video first');
+    }
+
+    // Call the transcribe endpoint
+    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/transcribe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assetId: videoAsset.id }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to transcribe video');
+    }
+
+    const data = await response.json();
+    console.log('Transcription result:', data);
+
+    if (data.words && data.words.length > 0) {
+      // Split words into chunks based on natural speech pauses
+      // A pause of 0.7+ seconds indicates a new caption segment
+      const PAUSE_THRESHOLD = 0.7; // seconds
+      const MAX_WORDS_PER_CHUNK = 5; // Cap at 5 words max
+      const chunks: Array<{ words: typeof data.words; start: number; end: number }> = [];
+
+      let currentChunk: typeof data.words = [];
+
+      for (let i = 0; i < data.words.length; i++) {
+        const word = data.words[i];
+        const prevWord = data.words[i - 1];
+
+        // Start a new chunk if:
+        // 1. There's a significant pause between words
+        // 2. Current chunk has reached max words
+        const hasSignificantPause = prevWord && (word.start - prevWord.end) >= PAUSE_THRESHOLD;
+        const chunkIsFull = currentChunk.length >= MAX_WORDS_PER_CHUNK;
+
+        if (currentChunk.length > 0 && (hasSignificantPause || chunkIsFull)) {
+          // Save current chunk
+          chunks.push({
+            words: currentChunk,
+            start: currentChunk[0].start,
+            end: currentChunk[currentChunk.length - 1].end,
+          });
+          currentChunk = [];
+        }
+
+        currentChunk.push(word);
+      }
+
+      // Don't forget the last chunk
+      if (currentChunk.length > 0) {
+        chunks.push({
+          words: currentChunk,
+          start: currentChunk[0].start,
+          end: currentChunk[currentChunk.length - 1].end,
+        });
+      }
+
+      // Create all caption clips at once (batched for performance)
+      const captionsToAdd = chunks.map(chunk => {
+        const duration = chunk.end - chunk.start;
+        // Adjust word timestamps to be relative to chunk start
+        const relativeWords = chunk.words.map(w => ({
+          ...w,
+          start: w.start - chunk.start,
+          end: w.end - chunk.start,
+        }));
+        return {
+          words: relativeWords,
+          start: chunk.start,
+          duration,
+          style: {
+            ...(options?.highlightColor && { highlightColor: options.highlightColor }),
+            ...(options?.fontFamily && { fontFamily: options.fontFamily }),
+          },
+        };
+      });
+
+      addCaptionClipsBatch(captionsToAdd);
+      await saveProject();
+      console.log(`Created ${chunks.length} caption clips`);
+    } else {
+      throw new Error('No speech detected in video. Make sure your video has audible speech.');
+    }
+
+    return data;
+  }, [session, assets, addCaptionClipsBatch, saveProject]);
+
+  // Handle updating caption style
+  const handleUpdateCaptionStyle = useCallback((clipId: string, styleUpdates: Partial<CaptionStyle>) => {
+    updateCaptionStyle(clipId, styleUpdates);
+    saveProject();
+  }, [updateCaptionStyle, saveProject]);
 
   // Handle adding motion graphic to timeline
   const handleAddMotionGraphic = useCallback(async (
@@ -622,15 +766,23 @@ export default function Home() {
               />
             </div>
 
-            {/* Clip Properties Panel (shown when clip is selected) */}
+            {/* Clip/Caption Properties Panel (shown when clip is selected) */}
             {selectedClipId && (
               <div className="h-1/2 border-t border-zinc-800/50 bg-zinc-900/50 overflow-hidden">
-                <ClipPropertiesPanel
-                  clip={selectedClip}
-                  asset={selectedClipAsset}
-                  onUpdateTransform={handleUpdateClipTransform}
-                  onClose={() => setSelectedClipId(null)}
-                />
+                {selectedCaptionData ? (
+                  <CaptionPropertiesPanel
+                    captionData={selectedCaptionData}
+                    onUpdateStyle={(styleUpdates) => handleUpdateCaptionStyle(selectedClipId, styleUpdates)}
+                    onClose={() => setSelectedClipId(null)}
+                  />
+                ) : (
+                  <ClipPropertiesPanel
+                    clip={selectedClip}
+                    asset={selectedClipAsset}
+                    onUpdateTransform={handleUpdateClipTransform}
+                    onClose={() => setSelectedClipId(null)}
+                  />
+                )}
               </div>
             )}
           </div>
@@ -692,6 +844,7 @@ export default function Home() {
               onCutAtPlayhead={handleCutAtPlayhead}
               onDropAsset={handleDropAsset}
               onSave={saveProject}
+              getCaptionData={getCaptionData}
             />
           </ResizableVerticalPanel>
         </div>
@@ -736,6 +889,7 @@ export default function Home() {
                 <AIPromptPanel
                   onApplyEdit={handleApplyEdit}
                   onExtractKeywordsAndAddGifs={handleExtractKeywordsAndAddGifs}
+                  onTranscribeAndAddCaptions={handleTranscribeAndAddCaptions}
                   isApplying={isProcessing}
                   applyProgress={0}
                   applyStatus={currentStatus}

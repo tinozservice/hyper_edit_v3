@@ -12,6 +12,7 @@
     "@remotion/player": "^4.0.407",
     "@remotion/renderer": "^4.0.407",
     "@types/formidable": "^3.4.6",
+    "formdata-node": "^6.0.3",
     "formidable": "^3.5.4",
     "hono": "4.7.7",
     "lucide-react": "^0.510.0",

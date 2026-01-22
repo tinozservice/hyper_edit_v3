@@ -2152,6 +2152,339 @@ async function downloadGifAsAsset(session, gifUrl, keyword, timestamp) {
   }
 }
 
+// Handle simple transcription for captions using Gemini (returns word-level timestamps)
+// Check if local Whisper is available
+async function checkLocalWhisper() {
+  return new Promise((resolve) => {
+    const check = spawn('python3', ['-c', 'import whisper; print("ok")']);
+    let output = '';
+    check.stdout.on('data', (data) => { output += data.toString(); });
+    check.on('close', (code) => {
+      resolve(code === 0 && output.includes('ok'));
+    });
+    check.on('error', () => resolve(false));
+  });
+}
+
+// Run local Whisper transcription
+async function runLocalWhisper(audioPath, jobId) {
+  const scriptPath = join(process.cwd(), 'scripts', 'whisper-transcribe.py');
+
+  return new Promise((resolve, reject) => {
+    console.log(`[${jobId}] Running local Whisper...`);
+    const whisperProcess = spawn('python3', [scriptPath, audioPath, 'base']);
+
+    let stdout = '';
+    let stderr = '';
+
+    whisperProcess.stdout.on('data', (data) => { stdout += data.toString(); });
+    whisperProcess.stderr.on('data', (data) => {
+      stderr += data.toString();
+      // Log progress messages
+      const lines = data.toString().split('\n').filter(l => l.trim());
+      lines.forEach(line => console.log(`[${jobId}] Whisper: ${line}`));
+    });
+
+    whisperProcess.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`Whisper failed: ${stderr}`));
+        return;
+      }
+      try {
+        const result = JSON.parse(stdout);
+        if (result.error) {
+          reject(new Error(result.error));
+        } else {
+          resolve(result);
+        }
+      } catch (e) {
+        reject(new Error(`Failed to parse Whisper output: ${stdout}`));
+      }
+    });
+
+    whisperProcess.on('error', (err) => reject(err));
+  });
+}
+
+async function handleTranscribe(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = sessionId.substring(0, 8);
+  const audioPath = join(TEMP_DIR, `${jobId}-caption-audio.mp3`);
+
+  try {
+    // Check for transcription options in order of preference:
+    // 1. Local Whisper (free, accurate)
+    // 2. OpenAI Whisper API (paid, accurate)
+    // 3. Gemini (paid, less accurate timestamps)
+    const hasLocalWhisper = await checkLocalWhisper();
+    const openaiKey = process.env.OPENAI_API_KEY;
+    const geminiKey = process.env.GEMINI_API_KEY;
+
+    if (!hasLocalWhisper && !openaiKey && !geminiKey) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No transcription method available. Install local Whisper (pip3 install openai-whisper) or set GEMINI_API_KEY in .dev.vars' }));
+      return;
+    }
+
+    // Parse request body
+    let body = '';
+    for await (const chunk of req) {
+      body += chunk;
+    }
+    const { assetId } = JSON.parse(body || '{}');
+
+    // Determine which method to use
+    const useLocalWhisper = hasLocalWhisper;
+    const useOpenAIWhisper = !hasLocalWhisper && !!openaiKey;
+    const useGemini = !hasLocalWhisper && !openaiKey && !!geminiKey;
+
+    const method = useLocalWhisper ? 'Local Whisper' : useOpenAIWhisper ? 'OpenAI Whisper' : 'Gemini';
+    console.log(`\n[${jobId}] === TRANSCRIBE FOR CAPTIONS (${method}) ===`);
+
+    if (useLocalWhisper) {
+      console.log(`[${jobId}] Using local Whisper for accurate word-level timestamps (free)`);
+    } else if (useOpenAIWhisper) {
+      console.log(`[${jobId}] Using OpenAI Whisper API for accurate word-level timestamps`);
+    } else {
+      console.log(`[${jobId}] Using Gemini (timestamps may drift - install local Whisper for accurate sync)`);
+    }
+
+    // Find the video asset
+    let videoAsset = null;
+    if (assetId) {
+      videoAsset = session.assets.get(assetId);
+    } else {
+      // If no assetId, find the first video asset
+      for (const asset of session.assets.values()) {
+        if (asset.type === 'video') {
+          videoAsset = asset;
+          break;
+        }
+      }
+    }
+
+    if (!videoAsset) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No video asset found' }));
+      return;
+    }
+
+    console.log(`[${jobId}] Transcribing: ${videoAsset.filename}`);
+
+    // Get video duration
+    const totalDuration = await getVideoDuration(videoAsset.path);
+    console.log(`[${jobId}] Video duration: ${totalDuration.toFixed(2)}s`);
+
+    // Extract audio as MP3
+    console.log(`[${jobId}] Extracting audio...`);
+    await runFFmpeg([
+      '-y', '-i', videoAsset.path,
+      '-vn', '-acodec', 'libmp3lame',
+      '-ab', '64k', '-ar', '16000', '-ac', '1',
+      audioPath
+    ], jobId);
+
+    const { stat } = await import('fs/promises');
+    const audioStats = await stat(audioPath);
+    console.log(`[${jobId}] Audio extracted: ${(audioStats.size / 1024 / 1024).toFixed(1)} MB`);
+
+    // Transcribe using the available method
+    let transcription;
+
+    if (useLocalWhisper) {
+      // === Local Whisper - Free and accurate word-level timestamps ===
+      transcription = await runLocalWhisper(audioPath, jobId);
+      console.log(`[${jobId}] Local Whisper complete: ${transcription.words?.length || 0} words`);
+
+    } else if (useOpenAIWhisper) {
+      // === OpenAI Whisper API - Accurate word-level timestamps ===
+      console.log(`[${jobId}] Sending to OpenAI Whisper for transcription...`);
+      const audioBuffer = readFileSync(audioPath);
+
+      // Create FormData for multipart upload
+      const FormData = (await import('formdata-node')).FormData;
+      const { Blob } = await import('buffer');
+
+      const formData = new FormData();
+      formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
+      formData.append('model', 'whisper-1');
+      formData.append('response_format', 'verbose_json');
+      formData.append('timestamp_granularities[]', 'word');
+
+      const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${openaiKey}`,
+        },
+        body: formData,
+      });
+
+      if (!whisperResponse.ok) {
+        const errorText = await whisperResponse.text();
+        console.error(`[${jobId}] Whisper API error:`, errorText);
+        throw new Error(`Whisper API error: ${whisperResponse.status} - ${errorText}`);
+      }
+
+      const whisperResult = await whisperResponse.json();
+      console.log(`[${jobId}] Whisper transcription complete: ${whisperResult.words?.length || 0} words`);
+
+      transcription = {
+        text: whisperResult.text || '',
+        words: (whisperResult.words || []).map(w => ({
+          text: w.word || '',
+          start: w.start || 0,
+          end: w.end || 0,
+        }))
+      };
+
+    } else if (useGemini) {
+      // === Gemini - Estimated timestamps (less accurate) ===
+      console.log(`[${jobId}] Sending to Gemini for transcription...`);
+      const audioBuffer = readFileSync(audioPath);
+      const audioBase64 = audioBuffer.toString('base64');
+
+      const ai = new GoogleGenAI({ apiKey: geminiKey });
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.0-flash',
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                inlineData: {
+                  mimeType: 'audio/mp3',
+                  data: audioBase64
+                }
+              },
+              {
+                text: `Transcribe this audio with word-level timestamps. The audio is ${totalDuration.toFixed(1)} seconds long.
+
+IMPORTANT: Return ONLY valid JSON, no markdown, no explanation. The response must be parseable JSON.
+
+Return this exact JSON structure:
+{
+  "text": "full transcript text here",
+  "words": [
+    {"text": "word1", "start": 0.0, "end": 0.5},
+    {"text": "word2", "start": 0.5, "end": 1.0}
+  ]
+}
+
+Guidelines:
+- Include every spoken word
+- Timestamps should be in seconds (decimals allowed)
+- "start" is when the word begins, "end" is when it ends
+- Words should be in order
+- Estimate timing based on natural speech patterns if exact timing is unclear
+- Do not include filler sounds like "um" or "uh" unless they're clearly intentional`
+              }
+            ]
+          }
+        ]
+      });
+
+      const responseText = response.text || '';
+      console.log(`[${jobId}] Gemini response length: ${responseText.length} chars`);
+      console.log(`[${jobId}] Gemini raw response:`, responseText.substring(0, 1000));
+
+      // Parse the JSON response
+      try {
+        // First try direct parse
+        transcription = JSON.parse(responseText);
+      } catch (e1) {
+        try {
+          // Try to extract JSON from markdown code blocks
+          const codeBlockMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)```/);
+          if (codeBlockMatch) {
+            transcription = JSON.parse(codeBlockMatch[1].trim());
+          } else {
+            // Try to extract any JSON object
+            const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              transcription = JSON.parse(jsonMatch[0]);
+            } else {
+              throw new Error('No JSON found in response');
+            }
+          }
+        } catch (e2) {
+          console.error(`[${jobId}] Failed to parse Gemini response:`, responseText);
+
+          // Last resort: try to create a simple transcription from the text
+          // If Gemini just returned plain text, use that as the transcript
+          if (responseText && responseText.length > 10 && !responseText.startsWith('{')) {
+            console.log(`[${jobId}] Falling back to plain text transcription`);
+            const plainText = responseText.replace(/```[\s\S]*?```/g, '').trim();
+            const wordsArray = plainText.split(/\s+/).filter(w => w.length > 0);
+            const avgWordDuration = totalDuration / wordsArray.length;
+
+            transcription = {
+              text: plainText,
+              words: wordsArray.map((word, i) => ({
+                text: word.replace(/[.,!?;:'"]/g, ''),
+                start: i * avgWordDuration,
+                end: (i + 1) * avgWordDuration,
+              }))
+            };
+          } else {
+            throw new Error('Failed to parse transcription response from Gemini');
+          }
+        }
+      }
+    }
+
+    // Cleanup
+    try { unlinkSync(audioPath); } catch {}
+
+    const words = (transcription.words || []).map(w => ({
+      text: w.text || '',
+      start: parseFloat(w.start) || 0,
+      end: parseFloat(w.end) || 0,
+    })).filter(w => w.text.trim().length > 0); // Filter out empty words
+
+    console.log(`[${jobId}] Transcription complete: ${words.length} words`);
+    console.log(`[${jobId}] Text: "${(transcription.text || '').substring(0, 200)}..."`);
+
+    // Check if transcription is empty
+    if (words.length === 0 && (!transcription.text || transcription.text.trim().length === 0)) {
+      console.error(`[${jobId}] Empty transcription - Gemini returned no words`);
+      console.error(`[${jobId}] This could mean: no speech in video, audio too quiet, or unsupported language`);
+
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({
+        error: 'No speech detected. Make sure the video has clear, audible speech.',
+        debug: {
+          rawResponseLength: responseText.length,
+          rawResponsePreview: responseText.substring(0, 200)
+        }
+      }));
+      return;
+    }
+
+    console.log(`[${jobId}] === TRANSCRIPTION DONE ===\n`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      text: transcription.text || '',
+      words: words,
+      duration: totalDuration,
+    }));
+
+  } catch (error) {
+    console.error(`[${jobId}] Error:`, error.message);
+    try { unlinkSync(audioPath); } catch {}
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
 // Handle transcribe and extract keywords endpoint
 async function handleTranscribeAndExtract(req, res, sessionId) {
   const session = getSession(sessionId);
@@ -2414,6 +2747,10 @@ const server = http.createServer(async (req, res) => {
     // GIF creation
     else if (req.method === 'POST' && action === 'create-gif') {
       await handleCreateGif(req, res, sessionId);
+    }
+    // Simple transcription (for captions)
+    else if (req.method === 'POST' && action === 'transcribe') {
+      await handleTranscribe(req, res, sessionId);
     }
     // Transcription and keyword extraction
     else if (req.method === 'POST' && action === 'transcribe-and-extract') {

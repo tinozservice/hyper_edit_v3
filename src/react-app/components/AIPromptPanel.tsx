@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo } from 'lucide-react';
+import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type } from 'lucide-react';
 
 interface TranscriptKeyword {
   keyword: string;
@@ -18,11 +18,19 @@ interface ChatMessage {
   // For auto-GIF workflow
   extractedKeywords?: TranscriptKeyword[];
   isProcessingGifs?: boolean;
+  // For caption workflow
+  isCaptionWorkflow?: boolean;
+}
+
+interface CaptionOptions {
+  highlightColor: string;
+  fontFamily: string;
 }
 
 interface AIPromptPanelProps {
   onApplyEdit?: (command: string) => Promise<void>;
   onExtractKeywordsAndAddGifs?: () => Promise<void>;
+  onTranscribeAndAddCaptions?: (options?: CaptionOptions) => Promise<void>;
   isApplying?: boolean;
   applyProgress?: number;
   applyStatus?: string;
@@ -32,6 +40,7 @@ interface AIPromptPanelProps {
 export default function AIPromptPanel({
   onApplyEdit,
   onExtractKeywordsAndAddGifs,
+  onTranscribeAndAddCaptions,
   isApplying,
   applyProgress,
   applyStatus,
@@ -41,8 +50,18 @@ export default function AIPromptPanel({
   const [isProcessing, setIsProcessing] = useState(false);
   const [processingStatus, setProcessingStatus] = useState('');
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
+  const [showCaptionOptions, setShowCaptionOptions] = useState(false);
+  const [captionOptions, setCaptionOptions] = useState<CaptionOptions>({
+    highlightColor: '#FFD700',
+    fontFamily: 'Inter',
+  });
+
+  const FONT_OPTIONS = [
+    'Inter', 'Roboto', 'Poppins', 'Montserrat', 'Oswald', 'Bebas Neue', 'Arial', 'Helvetica'
+  ];
 
   const suggestions = [
+    { icon: Type, text: 'Add captions' },
     { icon: VolumeX, text: 'Remove dead air / silence' },
     { icon: Wand2, text: 'Remove background noise' },
     { icon: Clock, text: 'Speed up by 1.5x' },
@@ -61,6 +80,19 @@ export default function AIPromptPanel({
       lower.includes('smart gif') ||
       lower.includes('overlay gif') ||
       lower.includes('brand gif')
+    );
+  };
+
+  // Check if prompt is asking for captions/subtitles
+  const isCaptionPrompt = (text: string): boolean => {
+    const lower = text.toLowerCase();
+    return (
+      lower.includes('caption') ||
+      lower.includes('subtitle') ||
+      lower.includes('transcribe') ||
+      lower.includes('transcript') ||
+      lower.includes('add text') ||
+      lower.includes('speech to text')
     );
   };
 
@@ -97,6 +129,57 @@ export default function AIPromptPanel({
     throw new Error('Request timed out after 60 seconds');
   };
 
+  // Handle the caption workflow
+  const handleCaptionWorkflow = async () => {
+    if (!onTranscribeAndAddCaptions) return;
+
+    setShowCaptionOptions(false);
+    setIsProcessing(true);
+    setProcessingStatus('Starting transcription...');
+
+    try {
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `Transcribing your video...\n\n1. Extracting audio from video\n2. Running local Whisper for accurate timestamps\n3. Adding captions to T1 track\n\nFont: ${captionOptions.fontFamily}\nHighlight: ${captionOptions.highlightColor}`,
+        isProcessingGifs: true,
+        isCaptionWorkflow: true,
+      }]);
+
+      await onTranscribeAndAddCaptions(captionOptions);
+
+      // Update the last message to show completion
+      setChatHistory(prev => {
+        const updated = [...prev];
+        const lastIdx = updated.length - 1;
+        if (updated[lastIdx]?.isProcessingGifs) {
+          updated[lastIdx] = {
+            ...updated[lastIdx],
+            text: 'Captions generated and added to your timeline! Select a caption clip to customize the style.',
+            isProcessingGifs: false,
+            applied: true,
+            isCaptionWorkflow: true,
+          };
+        }
+        return updated;
+      });
+
+    } catch (error) {
+      console.error('Caption workflow error:', error);
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}. Make sure the ffmpeg server is running.`,
+      }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
+  // Show caption options dialog
+  const promptForCaptions = () => {
+    setShowCaptionOptions(true);
+  };
+
   // Handle the auto-GIF workflow
   const handleAutoGifWorkflow = async () => {
     if (!onExtractKeywordsAndAddGifs) return;
@@ -107,7 +190,7 @@ export default function AIPromptPanel({
     try {
       setChatHistory(prev => [...prev, {
         type: 'assistant',
-        text: 'Analyzing your video for keywords and brands...',
+        text: 'Analyzing your video for keywords and brands...\n\n1. Extracting audio and transcribing\n2. Finding keywords and brands\n3. Searching for relevant GIFs\n4. Adding to timeline at correct timestamps',
         isProcessingGifs: true,
       }]);
 
@@ -149,6 +232,25 @@ export default function AIPromptPanel({
 
     // Add user message to chat
     setChatHistory((prev) => [...prev, { type: 'user', text: userMessage }]);
+
+    // Check if this is a caption request
+    if (isCaptionPrompt(userMessage)) {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: 'Please upload a video first. I\'ll then transcribe it and add animated captions to your timeline.',
+        }]);
+        return;
+      }
+
+      // Show caption options UI
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: 'Configure your caption style below, then click "Add Captions" to start.',
+      }]);
+      setShowCaptionOptions(true);
+      return;
+    }
 
     // Check if this is an auto-GIF request
     if (isAutoGifPrompt(userMessage)) {
@@ -316,19 +418,11 @@ export default function AIPromptPanel({
                   <div className="bg-zinc-800 rounded-lg p-3 space-y-2">
                     <p className="text-sm text-zinc-200">{message.text}</p>
 
-                    {/* Processing GIFs indicator */}
+                    {/* Processing indicator */}
                     {message.isProcessingGifs && (
-                      <div className="mt-2 space-y-2">
-                        <div className="flex items-center gap-2 text-xs text-orange-400">
-                          <Loader2 className="w-3 h-3 animate-spin" />
-                          <span>Transcribing video...</span>
-                        </div>
-                        <div className="text-[10px] text-zinc-500">
-                          1. Extracting audio and transcribing<br />
-                          2. Finding keywords and brands<br />
-                          3. Searching for relevant GIFs<br />
-                          4. Adding to timeline at correct timestamps
-                        </div>
+                      <div className="mt-2 flex items-center gap-2 text-xs text-orange-400">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        <span>Processing...</span>
                       </div>
                     )}
 
@@ -350,11 +444,11 @@ export default function AIPromptPanel({
                       </div>
                     )}
 
-                    {/* Success indicator for GIF workflow */}
+                    {/* Success indicator for GIF/Caption workflow */}
                     {message.applied && !message.command && (
                       <div className="mt-2 flex items-center gap-2 px-3 py-2 bg-emerald-500/20 rounded-lg text-xs font-medium text-emerald-400">
                         <CheckCircle className="w-3 h-3" />
-                        GIFs added to timeline
+                        {message.isCaptionWorkflow ? 'Captions added to timeline' : 'GIFs added to timeline'}
                       </div>
                     )}
 
@@ -409,6 +503,58 @@ export default function AIPromptPanel({
           </div>
         )}
       </div>
+
+      {/* Caption Options UI */}
+      {showCaptionOptions && (
+        <div className="p-4 border-t border-zinc-800/50 bg-zinc-800/50">
+          <div className="space-y-3">
+            <div className="text-xs font-medium text-zinc-300">Caption Style</div>
+
+            {/* Font Selection */}
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-zinc-400 w-20">Font:</label>
+              <select
+                value={captionOptions.fontFamily}
+                onChange={(e) => setCaptionOptions(prev => ({ ...prev, fontFamily: e.target.value }))}
+                className="flex-1 px-2 py-1.5 bg-zinc-700 border border-zinc-600 rounded text-xs text-white"
+              >
+                {FONT_OPTIONS.map(font => (
+                  <option key={font} value={font}>{font}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Highlight Color */}
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-zinc-400 w-20">Highlight:</label>
+              <input
+                type="color"
+                value={captionOptions.highlightColor}
+                onChange={(e) => setCaptionOptions(prev => ({ ...prev, highlightColor: e.target.value }))}
+                className="w-8 h-8 rounded cursor-pointer bg-zinc-700 border border-zinc-600"
+              />
+              <span className="text-xs text-zinc-500">{captionOptions.highlightColor}</span>
+            </div>
+
+            {/* Action Buttons */}
+            <div className="flex gap-2 pt-2">
+              <button
+                onClick={() => setShowCaptionOptions(false)}
+                className="flex-1 px-3 py-2 bg-zinc-700 hover:bg-zinc-600 rounded-lg text-xs font-medium transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleCaptionWorkflow}
+                disabled={isProcessing}
+                className="flex-1 px-3 py-2 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 rounded-lg text-xs font-medium transition-all"
+              >
+                Add Captions
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Input */}
       <form onSubmit={handleSubmit} className="p-4 border-t border-zinc-800/50">

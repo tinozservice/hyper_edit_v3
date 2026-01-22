@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { Film, Image, Music, X } from 'lucide-react';
+import { Film, Image, Music, X, Type } from 'lucide-react';
 import type { TimelineClip as TimelineClipType, Asset } from '@/react-app/hooks/useProject';
 
 interface TimelineClipProps {
@@ -13,22 +13,26 @@ interface TimelineClipProps {
   onResize: (newInPoint: number, newOutPoint: number, newStart?: number) => void;
   onDragEnd: () => void;
   onDelete: () => void;
+  captionPreview?: string;  // For caption clips - first few words
+  isCaption?: boolean;       // Whether this is a caption clip
 }
 
-const getAssetIcon = (type?: Asset['type']) => {
+const getAssetIcon = (type?: Asset['type'] | 'caption') => {
   switch (type) {
     case 'video': return Film;
     case 'image': return Image;
     case 'audio': return Music;
+    case 'caption': return Type;
     default: return Film;
   }
 };
 
-const getClipColor = (type?: Asset['type']) => {
+const getClipColor = (type?: Asset['type'] | 'caption') => {
   switch (type) {
     case 'video': return 'from-blue-500 to-cyan-500';
     case 'image': return 'from-amber-500 to-orange-500';
     case 'audio': return 'from-emerald-500 to-teal-500';
+    case 'caption': return 'from-purple-500 to-pink-500';
     default: return 'from-gray-500 to-gray-600';
   }
 };
@@ -44,6 +48,8 @@ export default function TimelineClip({
   onResize,
   onDragEnd,
   onDelete,
+  captionPreview,
+  isCaption = false,
 }: TimelineClipProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [isResizingLeft, setIsResizingLeft] = useState(false);
@@ -55,8 +61,8 @@ export default function TimelineClip({
 
   const clipRef = useRef<HTMLDivElement>(null);
 
-  const Icon = getAssetIcon(asset?.type);
-  const colorClass = getClipColor(asset?.type);
+  const Icon = getAssetIcon(isCaption ? 'caption' : asset?.type);
+  const colorClass = getClipColor(isCaption ? 'caption' : asset?.type);
 
   const left = clip.start * pixelsPerSecond;
   const width = Math.max(clip.duration * pixelsPerSecond, 30); // Minimum width
@@ -192,8 +198,10 @@ export default function TimelineClip({
 
       {/* Clip content */}
       <div className="flex items-center gap-1.5 px-2 h-full overflow-hidden pointer-events-none">
-        {/* Thumbnail */}
-        {asset?.thumbnailUrl && asset.type !== 'audio' ? (
+        {/* Thumbnail or Icon */}
+        {isCaption ? (
+          <Icon className="w-4 h-4 flex-shrink-0" />
+        ) : asset?.thumbnailUrl && asset.type !== 'audio' ? (
           <div className="w-6 h-6 flex-shrink-0 rounded overflow-hidden">
             <img
               src={asset.thumbnailUrl}
@@ -206,9 +214,9 @@ export default function TimelineClip({
           <Icon className="w-4 h-4 flex-shrink-0" />
         )}
 
-        {/* Name */}
+        {/* Name or Caption Preview */}
         <span className="text-xs font-medium truncate">
-          {asset?.filename || 'Unknown'}
+          {isCaption ? (captionPreview || 'Caption') : (asset?.filename || 'Unknown')}
         </span>
       </div>
 

@@ -39,9 +39,37 @@ export interface TimelineClip {
 // Track
 export interface Track {
   id: string;
-  type: 'video' | 'audio';
+  type: 'video' | 'audio' | 'text';
   name: string;
   order: number;
+}
+
+// Caption word with timing
+export interface CaptionWord {
+  text: string;
+  start: number;
+  end: number;
+}
+
+// Caption styling options
+export interface CaptionStyle {
+  fontFamily: string;
+  fontSize: number;
+  fontWeight: 'normal' | 'bold' | 'black';
+  color: string;
+  backgroundColor?: string;
+  strokeColor?: string;
+  strokeWidth?: number;
+  position: 'bottom' | 'center' | 'top';
+  animation: 'none' | 'karaoke' | 'fade' | 'pop' | 'bounce';
+  highlightColor?: string;
+  timeOffset?: number; // Offset in seconds to adjust sync (negative = earlier, positive = later)
+}
+
+// Caption clip data (stored alongside TimelineClip)
+export interface CaptionData {
+  words: CaptionWord[];
+  style: CaptionStyle;
 }
 
 // Project settings
@@ -68,11 +96,15 @@ export function useProject() {
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [tracks, setTracks] = useState<Track[]>([
-    { id: 'V2', type: 'video', name: 'V2', order: 0 },  // Overlay track (top)
-    { id: 'V1', type: 'video', name: 'V1', order: 1 },  // Base track (below overlay)
-    { id: 'A1', type: 'audio', name: 'A1', order: 2 },  // Audio track (bottom)
+    { id: 'T1', type: 'text', name: 'T1', order: 0 },   // Captions/text track (top)
+    { id: 'V3', type: 'video', name: 'V3', order: 1 },  // Top overlay
+    { id: 'V2', type: 'video', name: 'V2', order: 2 },  // Overlay
+    { id: 'V1', type: 'video', name: 'V1', order: 3 },  // Base video track
+    { id: 'A1', type: 'audio', name: 'A1', order: 4 },  // Audio track 1
+    { id: 'A2', type: 'audio', name: 'A2', order: 5 },  // Audio track 2
   ]);
   const [clips, setClips] = useState<TimelineClip[]>([]);
+  const [captionData, setCaptionData] = useState<Record<string, CaptionData>>({});
   const [settings, setSettings] = useState<ProjectSettings>({
     width: 1920,
     height: 1080,
@@ -309,6 +341,109 @@ export function useProject() {
     return secondClip.id;
   }, [clips]);
 
+  // Default caption style
+  const defaultCaptionStyle: CaptionStyle = {
+    fontFamily: 'Inter',
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#FFFFFF',
+    strokeColor: '#000000',
+    strokeWidth: 2,
+    position: 'bottom',
+    animation: 'karaoke',
+    highlightColor: '#FFD700',
+  };
+
+  // Add caption clip to timeline
+  const addCaptionClip = useCallback((
+    words: CaptionWord[],
+    start: number,
+    duration: number,
+    style?: Partial<CaptionStyle>
+  ): TimelineClip => {
+    const clipId = crypto.randomUUID();
+
+    // Create the timeline clip
+    const clip: TimelineClip = {
+      id: clipId,
+      assetId: '', // No asset for captions
+      trackId: 'T1',
+      start,
+      duration,
+      inPoint: 0,
+      outPoint: duration,
+    };
+
+    // Store caption data separately
+    const captionInfo: CaptionData = {
+      words,
+      style: { ...defaultCaptionStyle, ...style },
+    };
+
+    setClips(prev => [...prev, clip]);
+    setCaptionData(prev => ({ ...prev, [clipId]: captionInfo }));
+
+    return clip;
+  }, []);
+
+  // Add multiple caption clips at once (batched for performance)
+  const addCaptionClipsBatch = useCallback((
+    captions: Array<{
+      words: CaptionWord[];
+      start: number;
+      duration: number;
+      style?: Partial<CaptionStyle>;
+    }>
+  ): TimelineClip[] => {
+    const newClips: TimelineClip[] = [];
+    const newCaptionData: Record<string, CaptionData> = {};
+
+    for (const caption of captions) {
+      const clipId = crypto.randomUUID();
+
+      newClips.push({
+        id: clipId,
+        assetId: '',
+        trackId: 'T1',
+        start: caption.start,
+        duration: caption.duration,
+        inPoint: 0,
+        outPoint: caption.duration,
+      });
+
+      newCaptionData[clipId] = {
+        words: caption.words,
+        style: { ...defaultCaptionStyle, ...caption.style },
+      };
+    }
+
+    // Single state update for all clips
+    setClips(prev => [...prev, ...newClips]);
+    setCaptionData(prev => ({ ...prev, ...newCaptionData }));
+
+    return newClips;
+  }, []);
+
+  // Update caption style
+  const updateCaptionStyle = useCallback((clipId: string, styleUpdates: Partial<CaptionStyle>): void => {
+    setCaptionData(prev => {
+      const existing = prev[clipId];
+      if (!existing) return prev;
+      return {
+        ...prev,
+        [clipId]: {
+          ...existing,
+          style: { ...existing.style, ...styleUpdates },
+        },
+      };
+    });
+  }, []);
+
+  // Get caption data for a clip
+  const getCaptionData = useCallback((clipId: string): CaptionData | null => {
+    return captionData[clipId] || null;
+  }, [captionData]);
+
   // Save project to server (debounced)
   const saveProject = useCallback(async (): Promise<void> => {
     if (!session) return;
@@ -498,6 +633,13 @@ export function useProject() {
     moveClip,
     resizeClip,
     splitClip,
+
+    // Captions
+    captionData,
+    addCaptionClip,
+    addCaptionClipsBatch,
+    updateCaptionStyle,
+    getCaptionData,
 
     // Project
     saveProject,
