@@ -6,6 +6,7 @@ import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import formidable from 'formidable';
 import { GoogleGenAI } from '@google/genai';
+import { fal } from '@fal-ai/client';
 
 // Load environment variables from .dev.vars
 function loadEnvVars() {
@@ -25,6 +26,12 @@ function loadEnvVars() {
   }
 }
 loadEnvVars();
+
+// Configure fal.ai client - SDK expects FAL_KEY env var or credentials config
+// Map FAL_API_KEY to FAL_KEY for backward compatibility
+if (process.env.FAL_API_KEY && !process.env.FAL_KEY) {
+  process.env.FAL_KEY = process.env.FAL_API_KEY;
+}
 
 const PORT = 3333;
 const TEMP_DIR = join(tmpdir(), 'hyperedit-ffmpeg');
@@ -170,6 +177,38 @@ function restoreSessionsFromDisk() {
   }
 
   console.log(`[Server] Restored ${sessions.size} sessions from disk`);
+}
+
+// Save asset metadata to disk (preserves aiGenerated flag, etc.)
+function saveAssetMetadata(session) {
+  if (!session || !session.dir) return;
+
+  const assetsMetaPath = join(session.dir, 'assets-meta.json');
+  const metadata = {};
+
+  for (const [assetId, asset] of session.assets) {
+    // Only save metadata that needs to persist (not paths which are reconstructed)
+    metadata[assetId] = {
+      type: asset.type,
+      filename: asset.filename,
+      createdAt: asset.createdAt,
+      duration: asset.duration,
+      width: asset.width,
+      height: asset.height,
+      // AI-generated specific metadata
+      aiGenerated: asset.aiGenerated || false,
+      description: asset.description,
+      sceneCount: asset.sceneCount,
+      sceneDataPath: asset.sceneDataPath,
+      editCount: asset.editCount || 0,
+    };
+  }
+
+  try {
+    writeFileSync(assetsMetaPath, JSON.stringify(metadata, null, 2));
+  } catch (e) {
+    console.log(`[Session] Could not save assets metadata: ${e.message}`);
+  }
 }
 
 // Run restoration on module load
@@ -1556,6 +1595,7 @@ async function handleAssetUpload(req, res, sessionId) {
     };
 
     session.assets.set(assetId, asset);
+    saveAssetMetadata(session); // Persist asset metadata to disk
 
     console.log(`[${sessionId}] Asset uploaded: ${assetId} (${type}, ${(stats.size / 1024 / 1024).toFixed(1)} MB)`);
 
@@ -1632,6 +1672,7 @@ function handleAssetDelete(req, res, sessionId, assetId) {
 
   // Remove from session
   session.assets.delete(assetId);
+  saveAssetMetadata(session); // Update metadata file
 
   // Remove any clips using this asset
   session.project.clips = session.project.clips.filter(clip => clip.assetId !== assetId);
@@ -2351,8 +2392,8 @@ async function transcribeVideo(videoPath, jobId) {
 // Search GIPHY for a keyword
 async function searchGiphy(keyword, limit = 1) {
   const apiKey = process.env.GIPHY_API_KEY;
-  if (!apiKey) {
-    throw new Error('GIPHY_API_KEY not configured in .dev.vars');
+  if (!apiKey || apiKey === 'YOUR_GIPHY_API_KEY_HERE') {
+    throw new Error('GIPHY_API_KEY not configured. Get a free key at https://developers.giphy.com/');
   }
 
   const url = `https://api.giphy.com/v1/gifs/search?api_key=${apiKey}&q=${encodeURIComponent(keyword)}&limit=${limit}&rating=g&lang=en`;
@@ -2431,6 +2472,155 @@ async function downloadGifAsAsset(session, gifUrl, keyword, timestamp) {
   }
 }
 
+// Search GIPHY for trending GIFs
+async function searchGiphyTrending(limit = 20) {
+  const apiKey = process.env.GIPHY_API_KEY;
+  if (!apiKey || apiKey === 'YOUR_GIPHY_API_KEY_HERE') {
+    throw new Error('GIPHY_API_KEY not configured. Get a free key at https://developers.giphy.com/');
+  }
+
+  const url = `https://api.giphy.com/v1/gifs/trending?api_key=${apiKey}&limit=${limit}&rating=g`;
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`GIPHY API error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.data || [];
+}
+
+// Handle GIPHY search endpoint
+async function handleGiphySearch(req, res, sessionId, url) {
+  const session = sessions.get(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  try {
+    const query = url.searchParams.get('q') || '';
+    const limit = parseInt(url.searchParams.get('limit') || '20', 10);
+
+    if (!query.trim()) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Search query (q) is required' }));
+      return;
+    }
+
+    const gifs = await searchGiphy(query, limit);
+
+    // Format response
+    const results = gifs.map(gif => ({
+      id: gif.id,
+      title: gif.title,
+      url: gif.images.original.url,
+      previewUrl: gif.images.fixed_width.url,
+      thumbnailUrl: gif.images.fixed_width_still?.url || gif.images.fixed_width.url,
+      width: parseInt(gif.images.original.width, 10),
+      height: parseInt(gif.images.original.height, 10),
+      source: 'giphy',
+    }));
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ gifs: results }));
+  } catch (error) {
+    console.error('GIPHY search error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Handle GIPHY trending endpoint
+async function handleGiphyTrending(req, res, sessionId, url) {
+  const session = sessions.get(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  try {
+    const limit = parseInt(url.searchParams.get('limit') || '20', 10);
+    const gifs = await searchGiphyTrending(limit);
+
+    // Format response
+    const results = gifs.map(gif => ({
+      id: gif.id,
+      title: gif.title,
+      url: gif.images.original.url,
+      previewUrl: gif.images.fixed_width.url,
+      thumbnailUrl: gif.images.fixed_width_still?.url || gif.images.fixed_width.url,
+      width: parseInt(gif.images.original.width, 10),
+      height: parseInt(gif.images.original.height, 10),
+      source: 'giphy',
+    }));
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ gifs: results }));
+  } catch (error) {
+    console.error('GIPHY trending error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Handle adding a GIPHY GIF to assets
+async function handleGiphyAdd(req, res, sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  try {
+    // Parse request body
+    const body = await new Promise((resolve, reject) => {
+      let data = '';
+      req.on('data', chunk => { data += chunk; });
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error('Invalid JSON'));
+        }
+      });
+      req.on('error', reject);
+    });
+
+    const { gifUrl, title } = body;
+    if (!gifUrl) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'gifUrl is required' }));
+      return;
+    }
+
+    // Download and add to assets
+    const asset = await downloadGifAsAsset(session, gifUrl, title || 'GIF', Date.now());
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      success: true,
+      asset: {
+        id: asset.id,
+        filename: asset.filename,
+        type: asset.type,
+        duration: asset.duration,
+        width: asset.width,
+        height: asset.height,
+        thumbnailUrl: `/session/${sessionId}/assets/${asset.id}/thumbnail`,
+        streamUrl: `/session/${sessionId}/assets/${asset.id}/stream`,
+      }
+    }));
+  } catch (error) {
+    console.error('GIPHY add error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
 // Handle simple transcription for captions using Gemini (returns word-level timestamps)
 // Check if local Whisper is available
 async function checkLocalWhisper() {
@@ -2466,7 +2656,17 @@ async function runLocalWhisper(audioPath, jobId) {
 
     whisperProcess.on('close', (code) => {
       if (code !== 0) {
-        reject(new Error(`Whisper failed: ${stderr}`));
+        // Try to parse JSON error from stdout first
+        try {
+          const result = JSON.parse(stdout);
+          if (result.error) {
+            reject(new Error(`Whisper error: ${result.error}`));
+            return;
+          }
+        } catch (e) {
+          // stdout wasn't valid JSON, fall through to stderr
+        }
+        reject(new Error(`Whisper failed (exit code ${code}): ${stderr.slice(-500)}`));
         return;
       }
       try {
@@ -2477,7 +2677,7 @@ async function runLocalWhisper(audioPath, jobId) {
           resolve(result);
         }
       } catch (e) {
-        reject(new Error(`Failed to parse Whisper output: ${stdout}`));
+        reject(new Error(`Failed to parse Whisper output: ${stdout.slice(0, 200)}`));
       }
     });
 
@@ -2516,9 +2716,43 @@ async function getOrTranscribeVideo(session, videoAsset, jobId) {
 
   let transcription = { text: '', words: [] };
 
+  // Helper to transcribe with Gemini (always available as fallback if geminiKey exists)
+  const transcribeWithGeminiLocal = async () => {
+    if (!geminiKey) throw new Error('No transcription method available');
+    console.log(`[${jobId}] Using Gemini for transcription...`);
+    const ai = new GoogleGenAI({ apiKey: geminiKey });
+    const audioBuffer = readFileSync(audioPath);
+    const audioBase64 = audioBuffer.toString('base64');
+
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.0-flash',
+      contents: [{
+        role: 'user',
+        parts: [
+          { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
+          { text: `Transcribe this audio with word timestamps. Duration: ${videoAsset.duration}s. Return JSON: {"text": "full transcript", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
+        ]
+      }],
+    });
+
+    const respText = result.candidates[0].content.parts[0].text || '';
+    try {
+      return JSON.parse(respText);
+    } catch {
+      const match = respText.match(/\{[\s\S]*\}/);
+      return match ? JSON.parse(match[0]) : { text: respText, words: [] };
+    }
+  };
+
   if (hasLocalWhisper) {
-    console.log(`[${jobId}] Using local Whisper...`);
-    transcription = await runLocalWhisper(audioPath, jobId);
+    try {
+      console.log(`[${jobId}] Using local Whisper...`);
+      transcription = await runLocalWhisper(audioPath, jobId);
+    } catch (whisperError) {
+      console.log(`[${jobId}] Local Whisper failed: ${whisperError.message}`);
+      console.log(`[${jobId}] Falling back to Gemini...`);
+      transcription = await transcribeWithGeminiLocal();
+    }
   } else if (openaiKey) {
     console.log(`[${jobId}] Using OpenAI Whisper API...`);
     const { FormData, File } = await import('formdata-node');
@@ -2549,29 +2783,7 @@ async function getOrTranscribeVideo(session, videoAsset, jobId) {
       })),
     };
   } else if (geminiKey) {
-    console.log(`[${jobId}] Using Gemini for transcription...`);
-    const ai = new GoogleGenAI({ apiKey: geminiKey });
-    const audioBuffer = readFileSync(audioPath);
-    const audioBase64 = audioBuffer.toString('base64');
-
-    const result = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
-      contents: [{
-        role: 'user',
-        parts: [
-          { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
-          { text: `Transcribe this audio with word timestamps. Duration: ${videoAsset.duration}s. Return JSON: {"text": "full transcript", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
-        ]
-      }],
-    });
-
-    const respText = result.candidates[0].content.parts[0].text || '';
-    try {
-      transcription = JSON.parse(respText);
-    } catch {
-      const match = respText.match(/\{[\s\S]*\}/);
-      transcription = match ? JSON.parse(match[0]) : { text: respText, words: [] };
-    }
+    transcription = await transcribeWithGeminiLocal();
   }
 
   // Clean up audio file
@@ -2604,6 +2816,74 @@ function getTranscriptSegment(transcription, startTime, endTime) {
   }
 
   return segmentWords.map(w => w.text).join(' ');
+}
+
+// Extract numeric value from stat strings like "$10K+", "50%", "2.5M", "10,000", etc.
+// Returns { numericValue, prefix, suffix } where numericValue is the number to count TO
+function extractNumericValue(valueStr) {
+  if (!valueStr || typeof valueStr !== 'string') return null;
+
+  const str = valueStr.trim();
+  console.log(`[extractNumericValue] Input: "${str}"`);
+
+  // Extract prefix (currency symbols and other leading non-numeric chars)
+  let prefix = '';
+  const prefixMatch = str.match(/^([£$€¥₹#@~]+)/);
+  if (prefixMatch) {
+    prefix = prefixMatch[1];
+  }
+
+  // Extract the number part (including decimals and commas)
+  const numberMatch = str.match(/[\d,]+\.?\d*/);
+  if (!numberMatch || numberMatch[0] === '') {
+    console.log(`[extractNumericValue] No number found in "${str}"`);
+    return null;
+  }
+
+  let numericValue = parseFloat(numberMatch[0].replace(/,/g, ''));
+  if (isNaN(numericValue)) {
+    console.log(`[extractNumericValue] Could not parse number from "${numberMatch[0]}"`);
+    return null;
+  }
+
+  // Extract suffix - everything after the number
+  let suffix = '';
+  const numberEndIndex = str.indexOf(numberMatch[0]) + numberMatch[0].length;
+  const afterNumber = str.substring(numberEndIndex).trim();
+  console.log(`[extractNumericValue] Number: ${numericValue}, After: "${afterNumber}"`);
+
+  // Check for multiplier suffixes and apply them
+  if (/^k\b/i.test(afterNumber) || /^thousand/i.test(afterNumber)) {
+    numericValue *= 1000;
+    suffix = afterNumber.replace(/^k\b/i, '').replace(/^thousand/i, '').trim();
+  } else if (/^m\b/i.test(afterNumber) || /^million/i.test(afterNumber)) {
+    numericValue *= 1000000;
+    suffix = afterNumber.replace(/^m\b/i, '').replace(/^million/i, '').trim();
+  } else if (/^b\b/i.test(afterNumber) || /^billion/i.test(afterNumber)) {
+    numericValue *= 1000000000;
+    suffix = afterNumber.replace(/^b\b/i, '').replace(/^billion/i, '').trim();
+  } else {
+    suffix = afterNumber;
+  }
+
+  // Clean up suffix - keep only common suffix chars
+  // But preserve % and + which are important
+  if (suffix.includes('%')) {
+    suffix = '%';
+  } else if (suffix.includes('+')) {
+    suffix = '+';
+  } else {
+    suffix = suffix.replace(/[^%+\-KMB]/gi, '').trim();
+  }
+
+  const result = {
+    numericValue: Math.round(numericValue),
+    prefix,
+    suffix,
+  };
+
+  console.log(`[extractNumericValue] Result: ${JSON.stringify(result)}`);
+  return result;
 }
 
 async function handleTranscribe(req, res, sessionId) {
@@ -2699,8 +2979,37 @@ async function handleTranscribe(req, res, sessionId) {
 
     if (useLocalWhisper) {
       // === Local Whisper - Free and accurate word-level timestamps ===
-      transcription = await runLocalWhisper(audioPath, jobId);
-      console.log(`[${jobId}] Local Whisper complete: ${transcription.words?.length || 0} words`);
+      try {
+        transcription = await runLocalWhisper(audioPath, jobId);
+        console.log(`[${jobId}] Local Whisper complete: ${transcription.words?.length || 0} words`);
+      } catch (whisperError) {
+        console.log(`[${jobId}] Local Whisper failed: ${whisperError.message}`);
+        if (geminiKey) {
+          console.log(`[${jobId}] Falling back to Gemini for transcription...`);
+          // Fall through to Gemini transcription below by setting useGemini-like behavior
+          const audioBuffer = readFileSync(audioPath);
+          const audioBase64 = audioBuffer.toString('base64');
+          const ai = new GoogleGenAI({ apiKey: geminiKey });
+
+          const response = await ai.models.generateContent({
+            model: 'gemini-2.0-flash',
+            contents: [{ role: 'user', parts: [
+              { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
+              { text: `Transcribe this audio with word-level timestamps. Duration: ${totalDuration.toFixed(1)}s. Return JSON: {"text": "full text", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
+            ]}]
+          });
+
+          const responseText = response.text || '';
+          try {
+            transcription = JSON.parse(responseText);
+          } catch {
+            const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+            transcription = jsonMatch ? JSON.parse(jsonMatch[0]) : { text: responseText, words: [] };
+          }
+        } else {
+          throw whisperError;
+        }
+      }
 
     } else if (useOpenAIWhisper) {
       // === OpenAI Whisper API - Accurate word-level timestamps ===
@@ -3071,19 +3380,28 @@ Background: clean, uncluttered.`
 
     // Extract image from response
     const parts = response.candidates?.[0]?.content?.parts || [];
+    console.log(`    Response has ${parts.length} parts`);
+
     for (const part of parts) {
       if (part.inlineData?.data) {
         const imageBuffer = Buffer.from(part.inlineData.data, 'base64');
         writeFileSync(outputPath, imageBuffer);
-        console.log(`    Image saved: ${(imageBuffer.length / 1024).toFixed(1)} KB`);
+        console.log(`    ✓ Image saved: ${(imageBuffer.length / 1024).toFixed(1)} KB`);
         return true;
+      }
+      if (part.text) {
+        console.log(`    Part contains text: "${part.text.substring(0, 100)}..."`);
       }
     }
 
-    console.warn(`    No image in response, trying alternative prompt...`);
+    console.warn(`    ⚠️ No image data in response. Model may not support image generation.`);
+    console.warn(`    Response structure:`, JSON.stringify(response.candidates?.[0]?.content || {}).substring(0, 200));
     return false;
   } catch (error) {
-    console.error(`    Image generation failed: ${error.message}`);
+    console.error(`    ✗ Image generation failed: ${error.message}`);
+    if (error.message.includes('not found') || error.message.includes('404')) {
+      console.error(`    The model 'gemini-2.0-flash-exp-image-generation' may not be available.`);
+    }
     return false;
   }
 }
@@ -3146,8 +3464,30 @@ async function handleGenerateBroll(req, res, sessionId) {
 
     let transcription;
     if (hasLocalWhisper) {
-      console.log(`[${jobId}]    Using local Whisper...`);
-      transcription = await runLocalWhisper(audioPath, jobId);
+      try {
+        console.log(`[${jobId}]    Using local Whisper...`);
+        transcription = await runLocalWhisper(audioPath, jobId);
+      } catch (whisperError) {
+        console.log(`[${jobId}]    Local Whisper failed: ${whisperError.message}`);
+        console.log(`[${jobId}]    Falling back to Gemini...`);
+        const audioBuffer = readFileSync(audioPath);
+        const audioBase64 = audioBuffer.toString('base64');
+        const ai = new GoogleGenAI({ apiKey });
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.0-flash',
+          contents: [{ role: 'user', parts: [
+            { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
+            { text: `Transcribe this audio with word timestamps. Duration: ${totalDuration}s. Return JSON: {"text": "...", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
+          ]}]
+        });
+        const respText = response.text || '';
+        try {
+          transcription = JSON.parse(respText);
+        } catch {
+          const match = respText.match(/\{[\s\S]*\}/);
+          transcription = match ? JSON.parse(match[0]) : { text: respText, words: [] };
+        }
+      }
     } else if (openaiKey) {
       console.log(`[${jobId}]    Using OpenAI Whisper API...`);
       const audioBuffer = readFileSync(audioPath);
@@ -3275,6 +3615,7 @@ async function handleGenerateBroll(req, res, sessionId) {
         };
 
         session.assets.set(assetId, asset);
+        saveAssetMetadata(session); // Persist asset metadata to disk
 
         brollAssets.push({
           assetId: asset.id,
@@ -3388,6 +3729,7 @@ async function handleRenderMotionGraphic(req, res, sessionId) {
     };
 
     session.assets.set(assetId, asset);
+    saveAssetMetadata(session); // Persist asset metadata to disk
 
     console.log(`[${jobId}] Motion graphic rendered: ${assetId}`);
     console.log(`[${jobId}] === RENDER COMPLETE ===\n`);
@@ -3427,7 +3769,7 @@ async function handleGenerateAnimation(req, res, sessionId) {
 
   try {
     const body = await parseBody(req);
-    const { description, videoAssetId, startTime, endTime, attachedAssetIds, fps = 30, width = 1920, height = 1080 } = body;
+    const { description, videoAssetId, startTime, endTime, attachedAssetIds, fps = 30, width = 1920, height = 1080, durationSeconds } = body;
 
     if (!description) {
       res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
@@ -3465,7 +3807,9 @@ async function handleGenerateAnimation(req, res, sessionId) {
             if (startTime !== undefined && endTime !== undefined) {
               relevantSegment = getTranscriptSegment(transcription, startTime, endTime);
               detectedTimeRange = { start: startTime, end: endTime };
-              console.log(`[${jobId}] Using specified time range: ${startTime}s - ${endTime}s`);
+              console.log(`[${jobId}] ⏱️ Using USER-SPECIFIED time range: ${startTime}s - ${endTime}s`);
+              console.log(`[${jobId}] 📝 Extracted transcript segment (${relevantSegment.split(' ').length} words):`);
+              console.log(`[${jobId}]    "${relevantSegment.substring(0, 200)}${relevantSegment.length > 200 ? '...' : ''}"`);
             } else {
               // Use AI to identify the relevant part of the video based on the description
               console.log(`[${jobId}] Using AI to identify relevant video segment...`);
@@ -3526,14 +3870,19 @@ If unclear or general, use the middle third of the video.`
 
             // Build transcript context for the animation prompt
             if (relevantSegment) {
+              const timeRangeNote = detectedTimeRange
+                ? `\nThis segment is from ${detectedTimeRange.start.toFixed(1)}s to ${detectedTimeRange.end.toFixed(1)}s in the video.`
+                : '';
+
               transcriptContext = `
 
 VIDEO CONTEXT (from the transcript):
 "${relevantSegment.substring(0, 1500)}"
-${detectedTimeRange ? `
-This segment is from ${detectedTimeRange.start.toFixed(1)}s to ${detectedTimeRange.end.toFixed(1)}s in the video.` : ''}
+${timeRangeNote}
 
 IMPORTANT: The animation content should be relevant to and inspired by this video context. Use specific terms, concepts, and themes from the transcript to make the animation feel connected to the video content.`;
+
+              console.log(`[${jobId}] 🎯 Transcript context built for Gemini (${relevantSegment.length} chars)`);
             }
           }
         } catch (transcriptError) {
@@ -3611,18 +3960,68 @@ Return ONLY valid JSON (no markdown, no code blocks) with this structure:
   "scenes": [
     {
       "id": "unique-id",
-      "type": "title" | "steps" | "features" | "stats" | "text" | "transition" | "media",
+      "type": "title" | "steps" | "features" | "stats" | "text" | "transition" | "media" | "chart" | "comparison" | "countdown" | "shapes" | "emoji" | "gif" | "lottie",
       "duration": <number of frames at 30fps, typically 60-150>,
       "content": {
         "title": "optional title text",
         "subtitle": "optional subtitle",
-        "items": [{"icon": "emoji or number", "label": "text", "description": "optional"}],
-        "stats": [{"value": "10K+", "label": "Users"}],
+        "items": [{"icon": "emoji or number", "label": "text", "description": "optional", "value": 75, "color": "#hex"}],
+        "stats": [{"value": "10K+", "label": "Users", "numericValue": 10000, "prefix": "", "suffix": "+"}],  // IMPORTANT: numericValue must be a NUMBER (not string) for counting animation!
         "color": "#hex color for accent",
         "backgroundColor": "#hex for bg or null for transparent",
-        "mediaAssetId": "id of attached image/video to display (for media type scenes)",
-        "mediaStyle": "fullscreen" | "framed" | "pip" (picture-in-picture)
-      }
+        // MEDIA SCENE OPTIONS:
+        "mediaAssetId": "id of attached image/video to display",
+        "mediaStyle": "fullscreen" | "framed" | "pip" | "background" | "split-left" | "split-right" | "circle" | "phone-frame",
+        // VIDEO CONTROLS (for video assets):
+        "videoStartFrom": 0,  // frame to start playing from
+        "videoEndAt": 90,     // frame to stop at (for trimming)
+        "videoVolume": 1,     // 0-1
+        "videoPlaybackRate": 1, // 0.5 = slow-mo, 2 = fast forward
+        "videoLoop": false,
+        "videoMuted": false,
+        // MEDIA ANIMATION (ken-burns, zoom, pan on the media itself):
+        "mediaAnimation": {"type": "ken-burns" | "zoom-in" | "zoom-out" | "pan-left" | "pan-right" | "parallax", "intensity": 0.3},
+        // TEXT OVERLAY ON MEDIA:
+        "overlayText": "Text to show over media",
+        "overlayPosition": "top" | "center" | "bottom",
+        "overlayStyle": "minimal" | "bold" | "gradient-bar",
+        // SHAPES SCENE OPTIONS:
+        "shapes": [
+          {
+            "type": "circle" | "rect" | "triangle" | "star" | "polygon" | "ellipse",
+            "fill": "#hex color",
+            "stroke": "#hex outline color",
+            "strokeWidth": 2,
+            "x": 50, "y": 50,  // position as percentage (0-100)
+            "scale": 1,
+            "rotation": 0,
+            "delay": 0,  // animation delay in frames
+            "animation": "pop" | "spin" | "bounce" | "float" | "pulse" | "none",
+            // Shape-specific: radius (circle/polygon), width/height (rect), length/direction (triangle), points/innerRadius/outerRadius (star), rx/ry (ellipse)
+          }
+        ],
+        "shapesLayout": "scattered" | "grid" | "circle" | "custom",
+        // EMOJI SCENE OPTIONS:
+        "emojis": [
+          {
+            "emoji": "🔥",  // Use actual emoji characters
+            "x": 50, "y": 50,  // position as percentage
+            "scale": 0.2,  // size (0.1 = small, 0.3 = large)
+            "delay": 0,  // animation delay in frames
+            "animation": "pop" | "bounce" | "float" | "pulse" | "spin" | "shake" | "wave" | "none"
+          }
+        ],
+        "emojiLayout": "scattered" | "grid" | "circle" | "row" | "custom",
+        // OTHER SCENE OPTIONS:
+        "chartType": "bar" | "progress" | "pie",
+        "chartData": [{"label": "Category", "value": 75, "color": "#hex"}],
+        "maxValue": 100,
+        "beforeLabel": "BEFORE", "afterLabel": "AFTER",
+        "beforeValue": "50%", "afterValue": "95%",
+        "countFrom": 3, "countTo": 0,
+        "camera": {"type": "zoom-in" | "zoom-out" | "pan-left" | "pan-right" | "ken-burns" | "shake", "intensity": 0.3}
+      },
+      "transition": {"type": "swipe-left" | "swipe-right" | "swipe-up" | "swipe-down" | "fade" | "zoom-in" | "zoom-out" | "wipe-left" | "wipe-right" | "blur" | "flip", "duration": 15}
     }
   ],
   "backgroundColor": "#0a0a0a",
@@ -3634,17 +4033,86 @@ Scene types:
 - "title": Big centered title with optional subtitle (for intros/outros)
 - "steps": Numbered steps or process flow (1, 2, 3...)
 - "features": Feature showcase with icons
-- "stats": Animated statistics/numbers
+- "stats": Animated statistics/numbers with COUNTING animation (numbers count from 0 to target). CRITICAL: You MUST include "numericValue" as an INTEGER (e.g., 10000, not "10000") for the counting animation to work! Example: {"value": "$10K+", "label": "Revenue", "numericValue": 10000, "prefix": "$", "suffix": "+"}. Without numericValue, numbers will NOT animate!
 - "text": Simple text message
 - "transition": Brief transition between scenes
-- "media": Display an attached image/video (use mediaAssetId to reference)
+- "media": Display an attached image/video with ADVANCED controls:
+  * mediaStyle: "fullscreen" (edge-to-edge), "framed" (bordered), "pip" (small corner), "background" (dimmed behind text), "split-left"/"split-right" (half screen), "circle" (circular crop), "phone-frame" (mobile mockup)
+  * mediaAnimation: Apply ken-burns, zoom, or pan DIRECTLY on the media for dynamic effect
+  * overlayText: Add text over the media (great with "background" style)
+  * For videos: Use videoStartFrom/videoEndAt to trim, videoPlaybackRate for slow-mo (0.5) or speed-up (2)
+- "chart": Data visualization with chartType: "bar" (vertical bars), "progress" (horizontal progress bars), "pie" (pie chart). Use chartData array with label/value/color.
+- "comparison": Before/after comparison. Use beforeLabel, afterLabel, beforeValue, afterValue.
+- "countdown": Animated countdown. Use countFrom and countTo (e.g., 3 to 0).
+- "shapes": Animated SVG shapes scene! Create eye-catching visuals with:
+  * Shape types: "circle", "rect", "triangle", "star", "polygon", "ellipse"
+  * Animations: "pop" (scale up), "spin" (rotate), "bounce" (vertical movement), "float" (gentle hover), "pulse" (breathing effect)
+  * Layout: "scattered" (random positions), "grid" (organized), "circle" (arranged in circle), "custom" (use x/y)
+  * Example shapes: [{"type": "star", "fill": "#f97316", "points": 5, "outerRadius": 60, "x": 50, "y": 50, "animation": "spin"}]
+- "emoji": Animated emoji scene! Fun and expressive visuals:
+  * Use actual emoji characters: "🔥", "⭐", "🚀", "💯", "❤️", "🎉", "✨", "👍", "🎯", "💡", etc.
+  * Animations: "pop", "bounce", "float", "pulse", "spin", "shake", "wave"
+  * Layout: "scattered", "grid", "circle" (arranged around center), "row" (horizontal line), "custom"
+  * Example: [{"emoji": "🔥", "x": 30, "y": 50, "scale": 0.2, "animation": "bounce"}, {"emoji": "🚀", "x": 70, "y": 50, "animation": "float"}]
+  * Great for reactions, celebrations, emphasis!
+- "gif": Animated GIF scene! GIPHY integration for memes, reactions, and B-roll:
+  * Use "gifSearch" to search GIPHY for GIFs by keyword (the server will fetch actual URLs automatically!)
+  * Example: {"gifSearch": "mind blown", "gifLayout": "fullscreen"} - searches GIPHY for "mind blown" GIFs
+  * Can also use "gifSearches" array for multiple GIFs: {"gifSearches": ["fire", "celebration", "thumbs up"]}
+  * Properties for each GIF: x, y (position 0-100), width, height, scale, playbackRate (0.5=slow, 2=fast)
+  * Animations: "pop", "bounce", "float", "pulse", "spin", "shake" (applied to the GIF container)
+  * Layout: "fullscreen" (single GIF fills screen), "scattered", "grid", "circle", "row", "pip" (corner)
+  * Use "gifBackground": true for a looping GIF as the scene background (with dark overlay for readability)
+  * POPULAR SEARCHES: "reaction", "funny", "meme", "celebration", "mind blown", "shocked", "laughing", "applause", "fire", "thumbs up", "yes", "no", "thinking", "dancing"
+  * Great for: adding humor, emphasizing points, meme-style content, reaction clips!
+- "lottie": Professional After Effects animations! Smooth vector animations:
+  * Provide Lottie JSON URLs in the "lotties" array (from LottieFiles.com or similar)
+  * Properties: src (URL to JSON), x, y (position 0-100), width, height, scale, playbackRate, direction ("forward"/"backward")
+  * Layout: "fullscreen", "scattered", "grid", "circle", "row", "custom"
+  * Use "lottieBackground" for animated background (with dark overlay)
+  * Great for: loading spinners, confetti, celebrations, transitions, icons, illustrations
+  * Example: {"lotties": [{"src": "https://assets.lottiefiles.com/...", "width": 400, "height": 400}], "lottieLayout": "fullscreen"}
+
+Camera movement (add to any scene's content):
+- "zoom-in": Slowly zoom into the content
+- "zoom-out": Start zoomed, pull back
+- "pan-left" / "pan-right": Horizontal movement
+- "pan-up" / "pan-down": Vertical movement
+- "ken-burns": Classic documentary style (slow zoom + slight pan)
+- "intensity": 0.1 to 0.5 (subtle to dramatic)
+
+Scene transitions (add to scene to animate entry/exit):
+- "swipe-left" / "swipe-right": Slide in/out horizontally (most popular)
+- "swipe-up" / "swipe-down": Slide in/out vertically
+- "fade": Fade in/out (subtle, professional)
+- "zoom-in" / "zoom-out": Scale in/out with fade
+- "wipe-left" / "wipe-right": Reveal effect (like a curtain)
+- "blur": Blur transition (dreamy effect)
+- "flip": 3D flip effect (dramatic)
+- "duration": frames for transition (default 15, use 20-30 for dramatic)
 
 Guidelines:
 - Keep it concise: 3-6 scenes max
-- Total duration: 5-15 seconds (150-450 frames)
-- Use vibrant colors: #f97316 (orange), #3b82f6 (blue), #22c55e (green), #8b5cf6 (purple)
+- Total duration: ${durationSeconds ? `EXACTLY ${durationSeconds} seconds (${Math.round(durationSeconds * fps)} frames) - the user specifically requested this duration!` : '5-15 seconds (150-450 frames)'}
+- Use vibrant colors: #f97316 (orange), #3b82f6 (blue), #22c55e (green), #8b5cf6 (purple), #ec4899 (pink)
 - Make it visually engaging with good pacing
-${attachedAssetIds?.length ? '- IMPORTANT: Include media scenes to showcase the attached images/videos' : ''}`;
+
+IMPORTANT - ADD CAMERA MOVEMENTS to make scenes dynamic:
+- ADD "camera" to at least 2-3 scenes (especially title, stats, and media scenes)
+- Example: "content": { "title": "Hello", "camera": {"type": "zoom-in", "intensity": 0.25} }
+- Use "zoom-in" for focus and impact (intensity 0.2-0.3)
+- Use "ken-burns" for media/photos (intensity 0.25-0.35)
+- Use "pan-left" or "pan-right" for text reveals (intensity 0.2)
+- Use "shake" sparingly for energy (intensity 0.1-0.15)
+
+- When showing numbers/stats, use numericValue for animated counting effect
+- ADD TRANSITIONS between scenes! Use "swipe-left" or "swipe-right" for dynamic flow, "fade" for elegance, or "zoom-in" for impact
+- Mix transition types for variety (e.g., first scene: swipe-right, second: fade, third: swipe-left)
+${attachedAssetIds?.length ? `- IMPORTANT: Include media scenes to showcase the attached images/videos!
+- Use "mediaAnimation": {"type": "ken-burns", "intensity": 0.3} to add dynamic movement to images/videos
+- Use "background" mediaStyle with "overlayText" for cinematic text-over-video effect
+- For product shots, use "phone-frame" or "circle" mediaStyle
+- For videos, consider using slow-mo (videoPlaybackRate: 0.5) for dramatic moments` : ''}`;
 
     const result = await ai.models.generateContent({
       model: 'gemini-2.0-flash',
@@ -3666,6 +4134,14 @@ ${attachedAssetIds?.length ? '- IMPORTANT: Include media scenes to showcase the 
     }
 
     console.log(`[${jobId}] Generated ${sceneData.scenes.length} scenes`);
+
+    // Log camera movements for debugging
+    const scenesWithCamera = sceneData.scenes.filter(s => s.content?.camera?.type);
+    if (scenesWithCamera.length > 0) {
+      console.log(`[${jobId}] 🎥 Camera movements: ${scenesWithCamera.map(s => `${s.id}: ${s.content.camera.type}`).join(', ')}`);
+    } else {
+      console.log(`[${jobId}] ⚠️ No camera movements in any scene`);
+    }
 
     const totalDuration = sceneData.totalDuration || sceneData.scenes.reduce((sum, s) => sum + s.duration, 0);
     const durationInSeconds = totalDuration / fps;
@@ -3734,12 +4210,104 @@ ${attachedAssetIds?.length ? '- IMPORTANT: Include media scenes to showcase the 
       }
     }
 
+    // Post-process GIF scenes - search GIPHY and inject actual URLs
+    const giphyKey = process.env.GIPHY_API_KEY;
+    for (const scene of sceneData.scenes) {
+      if (scene.type === 'gif' && scene.content) {
+        const { gifSearch, gifSearches } = scene.content;
+        const searchTerms = gifSearches || (gifSearch ? [gifSearch] : []);
+
+        if (searchTerms.length > 0 && giphyKey) {
+          console.log(`[${jobId}] 🎬 Fetching GIFs from GIPHY for: ${searchTerms.join(', ')}`);
+          scene.content.gifs = [];
+
+          for (const term of searchTerms) {
+            try {
+              const gifs = await searchGiphy(term, 1);
+              if (gifs.length > 0) {
+                const gif = gifs[0];
+                const gifUrl = gif.images?.fixed_height?.url || gif.images?.original?.url;
+                if (gifUrl) {
+                  scene.content.gifs.push({
+                    src: gifUrl,
+                    width: parseInt(gif.images?.fixed_height?.width) || 400,
+                    height: parseInt(gif.images?.fixed_height?.height) || 300,
+                    title: gif.title || term,
+                    searchTerm: term,
+                  });
+                  console.log(`[${jobId}]    ✓ Found GIF for "${term}": ${gif.title || 'untitled'}`);
+                }
+              } else {
+                console.log(`[${jobId}]    ✗ No GIF found for "${term}"`);
+              }
+            } catch (err) {
+              console.log(`[${jobId}]    ✗ GIPHY search failed for "${term}": ${err.message}`);
+            }
+          }
+
+          // Set default layout if not specified
+          if (!scene.content.gifLayout && scene.content.gifs.length === 1) {
+            scene.content.gifLayout = 'fullscreen';
+          } else if (!scene.content.gifLayout) {
+            scene.content.gifLayout = 'scattered';
+          }
+
+          console.log(`[${jobId}]    Total GIFs fetched: ${scene.content.gifs.length}`);
+        } else if (searchTerms.length > 0 && !giphyKey) {
+          console.log(`[${jobId}] ⚠ GIPHY_API_KEY not configured - skipping GIF search`);
+        }
+      }
+    }
+
+    // Post-process stats to ensure numericValue is set for counting animation
+    for (const scene of sceneData.scenes) {
+      if (scene.type === 'stats' && scene.content?.stats) {
+        console.log(`[${jobId}] 📊 Processing stats scene with ${scene.content.stats.length} stats...`);
+        for (const stat of scene.content.stats) {
+          console.log(`[${jobId}]    Raw stat: value="${stat.value}", numericValue=${stat.numericValue} (type: ${typeof stat.numericValue}), prefix="${stat.prefix || ''}", suffix="${stat.suffix || ''}"`);
+
+          // Convert numericValue to number if it's a string
+          if (typeof stat.numericValue === 'string') {
+            const parsed = parseFloat(stat.numericValue);
+            if (!isNaN(parsed)) {
+              stat.numericValue = parsed;
+              console.log(`[${jobId}]    ✓ Converted string numericValue to number: ${stat.numericValue}`);
+            } else {
+              stat.numericValue = undefined; // Clear invalid string so we can extract from value
+            }
+          }
+
+          // If numericValue is not a valid positive number, try to extract from value string
+          const hasValidNumericValue = typeof stat.numericValue === 'number' && !isNaN(stat.numericValue) && stat.numericValue > 0;
+
+          if (!hasValidNumericValue && stat.value) {
+            const extracted = extractNumericValue(stat.value);
+            if (extracted && extracted.numericValue > 0) {
+              stat.numericValue = extracted.numericValue;
+              stat.prefix = stat.prefix || extracted.prefix;
+              stat.suffix = stat.suffix || extracted.suffix;
+              console.log(`[${jobId}]    ✓ Extracted: "${stat.value}" → prefix="${stat.prefix}" numericValue=${stat.numericValue} suffix="${stat.suffix}"`);
+            } else {
+              console.log(`[${jobId}]    ✗ Could not extract numeric value from "${stat.value}"`);
+            }
+          } else if (hasValidNumericValue) {
+            console.log(`[${jobId}]    ✓ Already has valid numericValue: ${stat.numericValue}`);
+          }
+
+          // Final check: log what will be used for rendering
+          const finalHasNumeric = typeof stat.numericValue === 'number' && !isNaN(stat.numericValue) && stat.numericValue > 0;
+          console.log(`[${jobId}]    → Final: numericValue=${stat.numericValue}, will animate: ${finalHasNumeric}`);
+        }
+      }
+    }
+
     // Step 2: Write props to JSON file for Remotion
     // Log final scene data for debugging
     console.log(`[${jobId}] Final scene data:`);
     for (const scene of sceneData.scenes) {
       const hasMedia = scene.content?.mediaPath ? `mediaPath: ${scene.content.mediaPath}` : 'no media';
-      console.log(`[${jobId}]   - ${scene.type}: ${scene.content?.title || '(no title)'} | ${hasMedia}`);
+      const hasStats = scene.content?.stats ? `stats: ${scene.content.stats.map(s => s.numericValue || s.value).join(', ')}` : '';
+      console.log(`[${jobId}]   - ${scene.type}: ${scene.content?.title || '(no title)'} | ${hasMedia} ${hasStats}`);
     }
     writeFileSync(propsPath, JSON.stringify(sceneData, null, 2));
     console.log(`[${jobId}] Props written to ${propsPath}`);
@@ -3759,6 +4327,7 @@ ${attachedAssetIds?.length ? '- IMPORTANT: Include media scenes to showcase the 
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
+      '--gl=swangle', // Software WebGL for headless rendering
     ];
 
     await new Promise((resolve, reject) => {
@@ -3829,6 +4398,7 @@ ${attachedAssetIds?.length ? '- IMPORTANT: Include media scenes to showcase the 
     };
 
     session.assets.set(assetId, asset);
+    saveAssetMetadata(session); // Persist AI-generated flag to disk
 
     console.log(`[${jobId}] AI animation rendered: ${assetId} (${durationInSeconds}s)`);
     console.log(`[${jobId}] === GENERATION COMPLETE ===\n`);
@@ -3926,6 +4496,58 @@ async function handleEditAnimation(req, res, sessionId) {
       console.log(`[${jobId}] V1 context: ${v1Context.filename} (${v1Context.type})`);
     }
 
+    // Build transcript context from source video if available
+    // Try V1 context first, but fall back to any non-AI-generated video in session
+    let transcriptContext = '';
+    let sourceVideoAsset = null;
+
+    // First, try the V1 clip if it's a real video (not AI-generated animation)
+    if (v1Context && v1Context.assetId && v1Context.type === 'video') {
+      const v1VideoAsset = session.assets.get(v1Context.assetId);
+      if (v1VideoAsset && v1VideoAsset.type === 'video' && !v1VideoAsset.aiGenerated) {
+        sourceVideoAsset = v1VideoAsset;
+        console.log(`[${jobId}] 📝 Using V1 source video for transcript: ${v1VideoAsset.filename}`);
+      }
+    }
+
+    // If V1 is an animation, find any source video in the session
+    if (!sourceVideoAsset) {
+      for (const asset of session.assets.values()) {
+        if (asset.type === 'video' && !asset.aiGenerated) {
+          sourceVideoAsset = asset;
+          console.log(`[${jobId}] 📝 Using session source video for transcript: ${asset.filename}`);
+          break;
+        }
+      }
+    }
+
+    // Fetch transcript from the source video
+    if (sourceVideoAsset) {
+      try {
+        const transcription = await getOrTranscribeVideo(session, sourceVideoAsset, jobId);
+        if (transcription.text) {
+          // Get first 1500 chars of transcript for context
+          const transcriptText = transcription.text.substring(0, 1500);
+          transcriptContext = `
+
+VIDEO TRANSCRIPT CONTEXT (what's being said in the video "${sourceVideoAsset.filename}"):
+"${transcriptText}"${transcription.text.length > 1500 ? '...' : ''}
+
+This is what the viewer is hearing. Use this context to make the animation content relevant and synchronized with the video's message. Consider:
+- Key topics and themes being discussed
+- Important words, phrases, or concepts that could be visualized
+- The tone and style of the content (educational, entertaining, promotional, etc.)
+- Specific facts, numbers, or quotes that could be highlighted`;
+          console.log(`[${jobId}] ✅ Transcript context added (${transcriptText.length} chars)`);
+        }
+      } catch (transcriptError) {
+        console.log(`[${jobId}] ⚠️ Could not get transcript: ${transcriptError.message}`);
+        // Continue without transcript - not a fatal error
+      }
+    } else {
+      console.log(`[${jobId}] ℹ️ No source video found for transcript context`);
+    }
+
     // Build asset context for Gemini
     let assetContext = '';
 
@@ -3965,7 +4587,75 @@ ${JSON.stringify(originalSceneData, null, 2)}
 
 ## USER'S REQUESTED CHANGE:
 "${editPrompt}"
-${assetContext}
+${assetContext}${transcriptContext}
+
+## SCENE STRUCTURE REFERENCE:
+Scene types and their content properties:
+- "title": { "title": "text", "subtitle": "optional text", "color": "#hex", "backgroundColor": "#hex" }
+- "text": { "title": "main text", "subtitle": "optional" }
+- "steps" / "features": { "title": "optional heading", "items": [{"icon": "emoji", "label": "text", "description": "optional"}] }
+- "stats": { "stats": [{"value": "10K+", "label": "Users", "numericValue": 10000}] }
+- "transition": { "color": "#hex" }
+
+## ADDING EMOJIS/ICONS:
+To add emojis or icons, use scene types that support "items" array:
+{
+  "type": "features",
+  "duration": 90,
+  "content": {
+    "title": "Optional heading",
+    "items": [
+      {"icon": "💯", "label": "100% Satisfaction"},
+      {"icon": "🔥", "label": "Hot Feature"},
+      {"icon": "⭐", "label": "5-Star Quality"}
+    ]
+  }
+}
+
+To add a SINGLE large emoji/icon, use a "title" scene with the emoji IN the title:
+{
+  "type": "title",
+  "duration": 60,
+  "content": {
+    "title": "💯",
+    "subtitle": "Perfect Score"
+  }
+}
+
+## CAMERA MOVEMENTS (IMPORTANT - add to make scenes dynamic):
+Camera movements make scenes more engaging. Add a "camera" object INSIDE the scene's "content":
+
+Available camera types:
+- "zoom-in": Slowly zoom into the content (intensity 0.2-0.4 recommended)
+- "zoom-out": Start zoomed in, pull back to reveal
+- "pan-left" / "pan-right": Horizontal tracking movement
+- "pan-up" / "pan-down": Vertical tilt movement
+- "ken-burns": Classic documentary style (slow zoom + subtle pan)
+- "shake": Camera shake for energy/impact (use low intensity 0.1-0.2)
+
+EXAMPLE - Complete scene with camera movement:
+{
+  "id": "intro-scene",
+  "type": "title",
+  "duration": 90,
+  "content": {
+    "title": "Welcome",
+    "subtitle": "Let's get started",
+    "color": "#ffffff",
+    "backgroundColor": "#1a1a2e",
+    "camera": {
+      "type": "zoom-in",
+      "intensity": 0.3
+    }
+  }
+}
+
+WHEN TO ADD CAMERA MOVEMENTS:
+- User says "add zoom", "zoom in", "zoom effect" → Add camera with type "zoom-in"
+- User says "add pan", "pan across", "tracking" → Add camera with type "pan-left" or "pan-right"
+- User says "ken burns", "documentary style" → Add camera with type "ken-burns"
+- User says "shake", "energy", "impact" → Add camera with type "shake" (low intensity)
+- User says "make it dynamic", "more movement", "cinematic" → Add camera movements to multiple scenes
 
 ## STRICT RULES - FOLLOW EXACTLY:
 1. Copy the ENTIRE existing animation structure above
@@ -3977,6 +4667,21 @@ ${assetContext}
 - User says "change the title to Hello World" → Only change the title text field, keep all colors/styles
 - User says "make it blue" → Only change color values, keep all text the same
 - User says "add a new scene" → Keep all existing scenes, append the new one
+- User says "add zoom effect" → Add camera object with zoom-in to relevant scenes
+- User says "add ken burns to the intro" → Add camera object to intro scene only
+- User says "make it more dynamic" → Add camera movements and/or transitions to scenes
+- User says "add a 100 emoji" → Add a new scene with type "title" and title "💯" or add to items array
+- User says "add fire emoji" → Add "🔥" to title or items depending on context
+- User says "visualize the transcript" → Create scenes that highlight key words, phrases, or concepts from the transcript
+- User says "add kinetic typography" → Create animated text scenes using words from the transcript
+
+## TRANSCRIPT VISUALIZATION (if transcript context is provided):
+When transcript context is available, you can use it to:
+- Extract key quotes and display them with "title" or "text" scenes
+- Identify statistics or numbers mentioned and create "stats" scenes
+- Find key steps or points and create "steps" or "features" scenes
+- Pull important concepts and visualize them with relevant emojis/icons
+- Create word clouds or key phrase highlights
 
 ## EXAMPLES OF WRONG BEHAVIOR (DO NOT DO THIS):
 - Changing colors when user only asked about text
@@ -4007,6 +4712,14 @@ Return ONLY the complete JSON structure with your minimal change applied. No mar
 
     console.log(`[${jobId}] Modified to ${newSceneData.scenes.length} scenes`);
 
+    // Log camera movements for debugging
+    const scenesWithCamera = newSceneData.scenes.filter(s => s.content?.camera?.type);
+    if (scenesWithCamera.length > 0) {
+      console.log(`[${jobId}] 🎥 Camera movements: ${scenesWithCamera.map(s => `${s.id}: ${s.content.camera.type}`).join(', ')}`);
+    } else {
+      console.log(`[${jobId}] ⚠️ No camera movements in any scene`);
+    }
+
     const totalDuration = newSceneData.totalDuration || newSceneData.scenes.reduce((sum, s) => sum + s.duration, 0);
     const durationInSeconds = totalDuration / fps;
 
@@ -4032,6 +4745,7 @@ Return ONLY the complete JSON structure with your minimal change applied. No mar
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
+      '--gl=swangle', // Software WebGL for headless rendering
     ];
 
     await new Promise((resolve, reject) => {
@@ -4086,6 +4800,7 @@ Return ONLY the complete JSON structure with your minimal change applied. No mar
     originalAsset.lastEditPrompt = editPrompt;
     // Keep original description but track edit history
     originalAsset.editCount = (originalAsset.editCount || 0) + 1;
+    saveAssetMetadata(session); // Persist updated metadata to disk
 
     console.log(`[${jobId}] ========================================`);
     console.log(`[${jobId}] Animation updated IN-PLACE successfully!`);
@@ -4128,10 +4843,10 @@ async function handleGenerateImage(req, res, sessionId) {
     return;
   }
 
-  const falApiKey = process.env.FAL_API_KEY;
+  const falApiKey = process.env.FAL_KEY || process.env.FAL_API_KEY;
   if (!falApiKey) {
     res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-    res.end(JSON.stringify({ error: 'FAL_API_KEY not configured in .dev.vars' }));
+    res.end(JSON.stringify({ error: 'FAL_KEY or FAL_API_KEY not configured in .dev.vars' }));
     return;
   }
 
@@ -4223,40 +4938,28 @@ Enhanced: "Ancient moss-covered forest with towering redwood trees, ethereal mor
 
     // Call fal.ai nano-banana-pro API with enhanced prompt
     console.log(`[${jobId}] Sending to fal.ai...`);
-    const falResponse = await fetch('https://fal.run/fal-ai/nano-banana-pro', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Key ${falApiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
+    const falResult = await fal.run('fal-ai/nano-banana-pro', {
+      input: {
         prompt: enhancedPrompt,
         num_images: Math.min(numImages, 4),
         aspect_ratio: aspectRatio,
         resolution,
         output_format: 'png',
-        sync_mode: true,
-      }),
+      },
     });
+    console.log(`[${jobId}] Generated ${falResult.data?.images?.length || 0} images`);
 
-    if (!falResponse.ok) {
-      const errorText = await falResponse.text();
-      console.error(`[${jobId}] fal.ai error:`, errorText);
-      throw new Error(`fal.ai API error: ${falResponse.status} - ${errorText}`);
-    }
-
-    const falResult = await falResponse.json();
-    console.log(`[${jobId}] Generated ${falResult.images?.length || 0} images`);
-
-    if (!falResult.images || falResult.images.length === 0) {
+    // SDK returns { data, requestId }
+    const images = falResult.data?.images;
+    if (!images || images.length === 0) {
       throw new Error('No images generated');
     }
 
     // Download and save each generated image as an asset
     const generatedAssets = [];
 
-    for (let i = 0; i < falResult.images.length; i++) {
-      const imageData = falResult.images[i];
+    for (let i = 0; i < images.length; i++) {
+      const imageData = images[i];
       const imageId = randomUUID();
       const imagePath = join(session.assetsDir, `${imageId}.png`);
       const thumbPath = join(session.assetsDir, `${imageId}_thumb.jpg`);
@@ -4320,6 +5023,7 @@ Enhanced: "Ancient moss-covered forest with towering redwood trees, ethereal mor
       console.log(`[${jobId}] Saved image: ${asset.filename} (${(stats.size / 1024).toFixed(1)} KB)`);
     }
 
+    saveAssetMetadata(session); // Persist asset metadata to disk
     console.log(`[${jobId}] === PICASSO COMPLETE ===\n`);
 
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
@@ -4331,6 +5035,963 @@ Enhanced: "Ancient moss-covered forest with towering redwood trees, ethereal mor
 
   } catch (error) {
     console.error('Image generation error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Generate video from image using fal.ai (DiCaprio agent)
+async function handleGenerateVideo(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const falApiKey = process.env.FAL_KEY || process.env.FAL_API_KEY;
+  if (!falApiKey) {
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'FAL_KEY or FAL_API_KEY not configured in .dev.vars' }));
+    return;
+  }
+
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+
+  try {
+    const body = await parseBody(req);
+    const { prompt, imageAssetId, duration = 5 } = body;
+
+    if (!prompt) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'prompt is required' }));
+      return;
+    }
+
+    if (!imageAssetId) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'imageAssetId is required' }));
+      return;
+    }
+
+    // Get the source image asset
+    const imageAsset = session.assets.get(imageAssetId);
+    if (!imageAsset || imageAsset.type !== 'image') {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Image asset not found' }));
+      return;
+    }
+
+    const jobId = sessionId.substring(0, 8);
+    console.log(`\n[${jobId}] === DICAPRIO: GENERATE VIDEO ===`);
+    console.log(`[${jobId}] User prompt: ${prompt}`);
+    console.log(`[${jobId}] Source image: ${imageAsset.filename}`);
+    console.log(`[${jobId}] Duration: ${duration}s`);
+
+    // Enhance prompt using Gemini for better video generation
+    let enhancedPrompt = prompt;
+    if (geminiApiKey) {
+      try {
+        console.log(`[${jobId}] Enhancing prompt with DiCaprio AI...`);
+        const ai = new GoogleGenAI({ apiKey: geminiApiKey });
+
+        const systemPrompt = `You are DiCaprio, an expert AI prompt engineer specializing in image-to-video generation. Your role is to transform simple motion requests into detailed, cinematic prompts that produce stunning videos.
+
+## Your Expertise
+- Deep knowledge of cinematography, camera movements, and film techniques
+- Understanding of timing, pacing, and motion dynamics
+- Mastery of visual storytelling through movement
+- Knowledge of video generation model capabilities
+
+## Prompt Enhancement Guidelines
+
+1. **Camera Movement**: Be specific about camera motion (dolly, pan, tilt, zoom, crane, tracking, handheld)
+2. **Motion Direction**: Specify direction and speed (slow zoom in, gentle pan left, dynamic push forward)
+3. **Subject Motion**: Describe how elements in the scene should move (hair flowing, leaves rustling, water rippling)
+4. **Atmosphere**: Include atmospheric effects (light rays moving, dust particles, fog drifting)
+5. **Timing**: Use terms like "gradual", "sudden", "rhythmic", "smooth", "cinematic"
+
+## Response Format
+Return ONLY the enhanced prompt text. No explanations, no quotes, no markdown.
+
+## Example Input -> Output
+Input: "make it move"
+Output: "Cinematic slow zoom in with subtle parallax movement, gentle ambient motion with soft light rays drifting through the scene, atmospheric particles floating in the air, smooth and dreamlike camera drift"
+
+Input: "zoom out"
+Output: "Epic reveal shot with slow cinematic zoom out, camera gently pulling back to reveal the full scene, subtle atmospheric haze and soft light flares, smooth dolly movement with slight vertical lift"`;
+
+        const result = await ai.models.generateContent({
+          model: 'gemini-2.0-flash',
+          contents: [
+            { role: 'user', parts: [{ text: systemPrompt }] },
+            { role: 'user', parts: [{ text: `Enhance this video motion prompt: "${prompt}"` }] }
+          ],
+        });
+
+        enhancedPrompt = result.candidates[0].content.parts[0].text.trim();
+        console.log(`[${jobId}] Enhanced prompt: ${enhancedPrompt.substring(0, 100)}...`);
+      } catch (e) {
+        console.log(`[${jobId}] Prompt enhancement failed, using original: ${e.message}`);
+      }
+    }
+
+    // Upload image to fal.ai storage to get a URL (handles large files)
+    console.log(`[${jobId}] Uploading image to fal.ai storage...`);
+    const imageBuffer = readFileSync(imageAsset.path);
+    const mimeType = imageAsset.filename.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
+    const imageBlob = new Blob([imageBuffer], { type: mimeType });
+    const uploadedImageUrl = await fal.storage.upload(imageBlob);
+    console.log(`[${jobId}] Image uploaded: ${uploadedImageUrl.substring(0, 50)}...`);
+
+    console.log(`[${jobId}] Calling fal.ai video generation...`);
+
+    // Use fal.ai SDK with automatic queue handling
+    const falResult = await fal.subscribe('fal-ai/kling-video/v1.5/pro/image-to-video', {
+      input: {
+        prompt: enhancedPrompt,
+        image_url: uploadedImageUrl,
+        duration: duration === 10 ? '10' : '5',
+        aspect_ratio: '16:9',
+      },
+      logs: true,
+      onQueueUpdate: (update) => {
+        if (update.status === 'IN_QUEUE') {
+          console.log(`[${jobId}] Queued at position ${update.position || '?'}`);
+        } else if (update.status === 'IN_PROGRESS') {
+          console.log(`[${jobId}] Processing...`);
+        }
+      },
+    });
+
+    console.log(`[${jobId}] Video generation complete!`);
+
+    // Download the generated video - SDK returns { data, requestId }
+    const videoUrl = falResult.data?.video?.url;
+    if (!videoUrl) {
+      throw new Error('No video URL in response');
+    }
+
+    const videoResponse = await fetch(videoUrl);
+    if (!videoResponse.ok) {
+      throw new Error('Failed to download generated video');
+    }
+
+    const videoBuffer = Buffer.from(await videoResponse.arrayBuffer());
+
+    // Save to assets
+    const videoId = randomUUID();
+    const shortPrompt = prompt.substring(0, 30).replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-');
+    const videoPath = join(session.assetsDir, `${videoId}.mp4`);
+    const thumbPath = join(session.assetsDir, `${videoId}_thumb.jpg`);
+
+    writeFileSync(videoPath, videoBuffer);
+
+    // Generate thumbnail
+    await runFFmpeg([
+      '-y', '-i', videoPath,
+      '-vf', 'scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2',
+      '-frames:v', '1',
+      thumbPath
+    ], jobId);
+
+    // Get video duration using ffprobe
+    let videoDuration = duration;
+    try {
+      const probeResult = await new Promise((resolve, reject) => {
+        const proc = spawn('ffprobe', [
+          '-v', 'error',
+          '-show_entries', 'format=duration',
+          '-of', 'json',
+          videoPath
+        ]);
+        let output = '';
+        proc.stdout.on('data', d => output += d.toString());
+        proc.on('close', code => {
+          if (code === 0) {
+            try {
+              const data = JSON.parse(output);
+              resolve(parseFloat(data.format.duration) || duration);
+            } catch { resolve(duration); }
+          } else {
+            resolve(duration);
+          }
+        });
+        proc.on('error', () => resolve(duration));
+      });
+      videoDuration = probeResult;
+    } catch (e) {
+      console.log(`[${jobId}] Could not probe video duration, using default`);
+    }
+
+    const { stat } = await import('fs/promises');
+    const stats = await stat(videoPath);
+
+    // Create asset entry
+    const asset = {
+      id: videoId,
+      filename: `dicaprio-${shortPrompt}.mp4`,
+      originalFilename: `dicaprio-${shortPrompt}.mp4`,
+      type: 'video',
+      path: videoPath,
+      thumbPath: existsSync(thumbPath) ? thumbPath : null,
+      size: stats.size,
+      duration: videoDuration,
+      width: 1920,
+      height: 1080,
+      uploadedAt: Date.now(),
+      generatedBy: 'dicaprio',
+      sourcePrompt: prompt,
+      enhancedPrompt: enhancedPrompt,
+      sourceImageId: imageAssetId,
+    };
+
+    session.assets.set(videoId, asset);
+    saveAssetMetadata(session);
+
+    console.log(`[${jobId}] Saved video: ${asset.filename} (${(stats.size / 1024 / 1024).toFixed(1)} MB)`);
+    console.log(`[${jobId}] === DICAPRIO COMPLETE ===\n`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      video: {
+        id: videoId,
+        filename: asset.filename,
+        thumbnailUrl: `/session/${sessionId}/assets/${videoId}/thumbnail`,
+        streamUrl: `/session/${sessionId}/assets/${videoId}/stream`,
+        duration: videoDuration,
+      },
+    }));
+
+  } catch (error) {
+    console.error('Video generation error:', error);
+    console.error('Error stack:', error.stack);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Restyle video using LTX-2 video-to-video (DiCaprio agent)
+async function handleRestyleVideo(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const falApiKey = process.env.FAL_KEY || process.env.FAL_API_KEY;
+  if (!falApiKey) {
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'FAL_KEY or FAL_API_KEY not configured in .dev.vars' }));
+    return;
+  }
+
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+
+  try {
+    const body = await parseBody(req);
+    const { prompt, videoAssetId } = body;
+
+    if (!prompt) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'prompt is required' }));
+      return;
+    }
+
+    if (!videoAssetId) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'videoAssetId is required' }));
+      return;
+    }
+
+    // Get the source video asset
+    const videoAsset = session.assets.get(videoAssetId);
+    if (!videoAsset || videoAsset.type !== 'video') {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Video asset not found' }));
+      return;
+    }
+
+    const jobId = sessionId.substring(0, 8);
+    console.log(`\n[${jobId}] === DICAPRIO: RESTYLE VIDEO ===`);
+    console.log(`[${jobId}] User prompt: ${prompt}`);
+    console.log(`[${jobId}] Source video: ${videoAsset.filename}`);
+
+    // Enhance prompt using Gemini for better style transfer
+    let enhancedPrompt = prompt;
+    if (geminiApiKey) {
+      try {
+        console.log(`[${jobId}] Enhancing style prompt with AI...`);
+        const ai = new GoogleGenAI({ apiKey: geminiApiKey });
+
+        const result = await ai.models.generateContent({
+          model: 'gemini-2.0-flash',
+          contents: [{
+            role: 'user',
+            parts: [{
+              text: `You are an expert at writing prompts for AI video style transfer. Transform this simple style request into a detailed, cinematic prompt that will produce stunning results.
+
+User request: "${prompt}"
+
+Write a detailed prompt describing the visual style. Include:
+- Color grading and mood
+- Texture and grain quality
+- Lighting style
+- Overall aesthetic
+- Any specific visual effects
+
+Return ONLY the enhanced prompt, no explanations.`
+            }]
+          }],
+        });
+
+        enhancedPrompt = result.candidates[0].content.parts[0].text.trim();
+        console.log(`[${jobId}] Enhanced prompt: ${enhancedPrompt.substring(0, 100)}...`);
+      } catch (e) {
+        console.log(`[${jobId}] Prompt enhancement failed, using original: ${e.message}`);
+      }
+    }
+
+    // Compress video for upload (fal.ai has size limits)
+    const compressedPath = join(TEMP_DIR, `${jobId}-compressed.mp4`);
+    console.log(`[${jobId}] Compressing video for upload...`);
+
+    // Compress to 720p max, lower bitrate for faster upload
+    await runFFmpeg([
+      '-y', '-i', videoAsset.path,
+      '-vf', 'scale=-2:720',  // Max 720p height, maintain aspect
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '28',  // Lower quality but smaller file
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-t', '10',  // Max 10 seconds for API limits
+      compressedPath
+    ], jobId);
+
+    // Upload compressed video to fal.ai storage
+    console.log(`[${jobId}] Uploading compressed video to fal.ai storage...`);
+    const videoBuffer = readFileSync(compressedPath);
+    const fileSizeMB = videoBuffer.length / (1024 * 1024);
+    console.log(`[${jobId}] Compressed size: ${fileSizeMB.toFixed(1)} MB`);
+
+    const videoBlob = new Blob([videoBuffer], { type: 'video/mp4' });
+    const uploadedVideoUrl = await fal.storage.upload(videoBlob);
+    console.log(`[${jobId}] Video uploaded: ${uploadedVideoUrl.substring(0, 50)}...`);
+
+    // Clean up compressed file
+    try { unlinkSync(compressedPath); } catch (e) {}
+
+    console.log(`[${jobId}] Calling fal.ai LTX-2 video-to-video...`);
+
+    // Use fal.ai SDK with automatic queue handling
+    const falResult = await fal.subscribe('fal-ai/ltx-2-19b/video-to-video', {
+      input: {
+        prompt: enhancedPrompt,
+        video_url: uploadedVideoUrl,
+        num_inference_steps: 40,
+        guidance_scale: 3,
+        video_strength: 0.7,
+        generate_audio: false,
+        video_quality: 'high',
+      },
+      logs: true,
+      onQueueUpdate: (update) => {
+        if (update.status === 'IN_QUEUE') {
+          console.log(`[${jobId}] Queued at position ${update.position || '?'}`);
+        } else if (update.status === 'IN_PROGRESS') {
+          console.log(`[${jobId}] Processing...`);
+        }
+      },
+    });
+
+    console.log(`[${jobId}] Video restyle complete!`);
+
+    // Download the restyled video - SDK returns { data, requestId }
+    const outputVideoUrl = falResult.data?.video?.url;
+    if (!outputVideoUrl) {
+      throw new Error('No video URL in response');
+    }
+
+    const videoResponse = await fetch(outputVideoUrl);
+    if (!videoResponse.ok) {
+      throw new Error('Failed to download restyled video');
+    }
+
+    const outputBuffer = Buffer.from(await videoResponse.arrayBuffer());
+
+    // Save to assets
+    const newVideoId = randomUUID();
+    const shortPrompt = prompt.substring(0, 20).replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-');
+    const outputPath = join(session.assetsDir, `${newVideoId}.mp4`);
+    const thumbPath = join(session.assetsDir, `${newVideoId}_thumb.jpg`);
+
+    writeFileSync(outputPath, outputBuffer);
+
+    // Generate thumbnail
+    await runFFmpeg([
+      '-y', '-i', outputPath,
+      '-vf', 'scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2',
+      '-frames:v', '1',
+      thumbPath
+    ], jobId);
+
+    // Get video duration
+    let videoDuration = videoAsset.duration || 5;
+    try {
+      const probeResult = await new Promise((resolve) => {
+        const proc = spawn('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', outputPath]);
+        let output = '';
+        proc.stdout.on('data', d => output += d.toString());
+        proc.on('close', code => {
+          if (code === 0) {
+            try { resolve(parseFloat(JSON.parse(output).format.duration)); }
+            catch { resolve(videoDuration); }
+          } else resolve(videoDuration);
+        });
+        proc.on('error', () => resolve(videoDuration));
+      });
+      videoDuration = probeResult;
+    } catch (e) { /* use default */ }
+
+    const { stat } = await import('fs/promises');
+    const stats = await stat(outputPath);
+
+    const asset = {
+      id: newVideoId,
+      filename: `restyled-${shortPrompt}.mp4`,
+      originalFilename: `restyled-${shortPrompt}.mp4`,
+      type: 'video',
+      path: outputPath,
+      thumbPath: existsSync(thumbPath) ? thumbPath : null,
+      size: stats.size,
+      duration: videoDuration,
+      width: falResult.video?.width || 1280,
+      height: falResult.video?.height || 720,
+      uploadedAt: Date.now(),
+      generatedBy: 'dicaprio-restyle',
+      sourcePrompt: prompt,
+      sourceVideoId: videoAssetId,
+    };
+
+    session.assets.set(newVideoId, asset);
+    saveAssetMetadata(session);
+
+    console.log(`[${jobId}] Saved restyled video: ${asset.filename}`);
+    console.log(`[${jobId}] === DICAPRIO RESTYLE COMPLETE ===\n`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      video: {
+        id: newVideoId,
+        filename: asset.filename,
+        thumbnailUrl: `/session/${sessionId}/assets/${newVideoId}/thumbnail`,
+        streamUrl: `/session/${sessionId}/assets/${newVideoId}/stream`,
+        duration: videoDuration,
+      },
+    }));
+
+  } catch (error) {
+    console.error('Video restyle error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Remove video background using Bria (DiCaprio agent)
+async function handleRemoveVideoBg(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const falApiKey = process.env.FAL_KEY || process.env.FAL_API_KEY;
+  if (!falApiKey) {
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'FAL_KEY or FAL_API_KEY not configured in .dev.vars' }));
+    return;
+  }
+
+  try {
+    const body = await parseBody(req);
+    const { videoAssetId } = body;
+
+    if (!videoAssetId) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'videoAssetId is required' }));
+      return;
+    }
+
+    // Get the source video asset
+    const videoAsset = session.assets.get(videoAssetId);
+    if (!videoAsset || videoAsset.type !== 'video') {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Video asset not found' }));
+      return;
+    }
+
+    const jobId = sessionId.substring(0, 8);
+    console.log(`\n[${jobId}] === DICAPRIO: REMOVE VIDEO BACKGROUND ===`);
+    console.log(`[${jobId}] Source video: ${videoAsset.filename}`);
+
+    // Compress video for upload (fal.ai has size limits)
+    const compressedPath = join(TEMP_DIR, `${jobId}-bg-compressed.mp4`);
+    console.log(`[${jobId}] Compressing video for upload...`);
+
+    // Compress to 720p max, lower bitrate for faster upload
+    await runFFmpeg([
+      '-y', '-i', videoAsset.path,
+      '-vf', 'scale=-2:720',  // Max 720p height, maintain aspect
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '28',  // Lower quality but smaller file
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-t', '10',  // Max 10 seconds for API limits
+      compressedPath
+    ], jobId);
+
+    // Upload compressed video to fal.ai storage
+    console.log(`[${jobId}] Uploading compressed video to fal.ai storage...`);
+    const videoBuffer = readFileSync(compressedPath);
+    const fileSizeMB = videoBuffer.length / (1024 * 1024);
+    console.log(`[${jobId}] Compressed size: ${fileSizeMB.toFixed(1)} MB`);
+
+    const videoBlob = new Blob([videoBuffer], { type: 'video/mp4' });
+    const uploadedVideoUrl = await fal.storage.upload(videoBlob);
+    console.log(`[${jobId}] Video uploaded: ${uploadedVideoUrl.substring(0, 50)}...`);
+
+    // Clean up compressed file
+    try { unlinkSync(compressedPath); } catch (e) {}
+
+    console.log(`[${jobId}] Calling fal.ai Bria video background removal...`);
+
+    // Use fal.ai SDK with automatic queue handling
+    const falResult = await fal.subscribe('fal-ai/ben/v2/video', {
+      input: {
+        video_url: uploadedVideoUrl,
+        output_format: 'webm',  // WebM for transparency support
+      },
+      logs: true,
+      onQueueUpdate: (update) => {
+        if (update.status === 'IN_QUEUE') {
+          console.log(`[${jobId}] Queued at position ${update.position || '?'}`);
+        } else if (update.status === 'IN_PROGRESS') {
+          console.log(`[${jobId}] Processing...`);
+        }
+      },
+    });
+
+    console.log(`[${jobId}] Background removal complete!`);
+
+    // Download the processed video - SDK returns { data, requestId }
+    const outputVideoUrl = falResult.data?.video?.url;
+    if (!outputVideoUrl) {
+      throw new Error('No video URL in response');
+    }
+
+    const videoResponse = await fetch(outputVideoUrl);
+    if (!videoResponse.ok) {
+      throw new Error('Failed to download processed video');
+    }
+
+    const outputBuffer = Buffer.from(await videoResponse.arrayBuffer());
+
+    // Save to assets (webm for transparency support)
+    const newVideoId = randomUUID();
+    const baseName = videoAsset.filename.replace(/\.[^/.]+$/, '');
+    const outputPath = join(session.assetsDir, `${newVideoId}.webm`);
+    const thumbPath = join(session.assetsDir, `${newVideoId}_thumb.jpg`);
+
+    writeFileSync(outputPath, outputBuffer);
+
+    // Generate thumbnail
+    await runFFmpeg([
+      '-y', '-i', outputPath,
+      '-vf', 'scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2',
+      '-frames:v', '1',
+      thumbPath
+    ], jobId);
+
+    // Get video duration
+    let videoDuration = videoAsset.duration || 5;
+    try {
+      const probeResult = await new Promise((resolve) => {
+        const proc = spawn('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', outputPath]);
+        let output = '';
+        proc.stdout.on('data', d => output += d.toString());
+        proc.on('close', code => {
+          if (code === 0) {
+            try { resolve(parseFloat(JSON.parse(output).format.duration)); }
+            catch { resolve(videoDuration); }
+          } else resolve(videoDuration);
+        });
+        proc.on('error', () => resolve(videoDuration));
+      });
+      videoDuration = probeResult;
+    } catch (e) { /* use default */ }
+
+    const { stat } = await import('fs/promises');
+    const stats = await stat(outputPath);
+
+    const asset = {
+      id: newVideoId,
+      filename: `${baseName}-nobg.webm`,
+      originalFilename: `${baseName}-nobg.webm`,
+      type: 'video',
+      path: outputPath,
+      thumbPath: existsSync(thumbPath) ? thumbPath : null,
+      size: stats.size,
+      duration: videoDuration,
+      width: videoAsset.width || 1920,
+      height: videoAsset.height || 1080,
+      uploadedAt: Date.now(),
+      generatedBy: 'dicaprio-remove-bg',
+      sourceVideoId: videoAssetId,
+      hasTransparency: true,
+    };
+
+    session.assets.set(newVideoId, asset);
+    saveAssetMetadata(session);
+
+    console.log(`[${jobId}] Saved video: ${asset.filename}`);
+    console.log(`[${jobId}] === DICAPRIO REMOVE BG COMPLETE ===\n`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      video: {
+        id: newVideoId,
+        filename: asset.filename,
+        thumbnailUrl: `/session/${sessionId}/assets/${newVideoId}/thumbnail`,
+        streamUrl: `/session/${sessionId}/assets/${newVideoId}/stream`,
+        duration: videoDuration,
+      },
+    }));
+
+  } catch (error) {
+    console.error('Video background removal error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Generate batch animations across the timeline based on video content analysis
+async function handleGenerateBatchAnimations(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' }));
+    return;
+  }
+
+  try {
+    const body = await parseBody(req);
+    const { count = 5, fps = 30, width = 1920, height = 1080 } = body;
+
+    const jobId = sessionId.substring(0, 8);
+    console.log(`\n[${jobId}] === GENERATE BATCH ANIMATIONS ===`);
+    console.log(`[${jobId}] Requested count: ${count}`);
+
+    // Find the first video asset in the session
+    let videoAsset = null;
+    for (const asset of session.assets.values()) {
+      if (asset.type === 'video' && !asset.aiGenerated) {
+        videoAsset = asset;
+        break;
+      }
+    }
+
+    if (!videoAsset) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No video asset found in session' }));
+      return;
+    }
+
+    console.log(`[${jobId}] Using video: ${videoAsset.filename} (${videoAsset.duration}s)`);
+
+    // Step 1: Get or create transcription
+    console.log(`[${jobId}] Step 1: Getting video transcription...`);
+    const transcription = await getOrTranscribeVideo(session, videoAsset, jobId);
+
+    if (!transcription.text) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Could not transcribe video' }));
+      return;
+    }
+
+    console.log(`[${jobId}] Transcription: ${transcription.text.substring(0, 200)}...`);
+
+    // Step 2: Use Gemini to plan animations across the video
+    console.log(`[${jobId}] Step 2: Planning ${count} animations with AI...`);
+
+    const ai = new GoogleGenAI({ apiKey });
+    const planResult = await ai.models.generateContent({
+      model: 'gemini-2.0-flash',
+      contents: [{
+        role: 'user',
+        parts: [{
+          text: `You are a video editor planning motion graphics animations for a video. Analyze this transcript and plan exactly ${count} animations that would enhance the video.
+
+VIDEO TRANSCRIPT:
+"${transcription.text}"
+
+VIDEO DURATION: ${videoAsset.duration} seconds
+
+WORD TIMESTAMPS (for timing reference):
+${transcription.words?.slice(0, 100).map(w => `[${w.start.toFixed(1)}s] ${w.text}`).join(' ') || 'Not available'}
+
+Plan exactly ${count} animations. Each should:
+1. Be placed at a strategic moment in the video (intro, key points, transitions, outro)
+2. Have a specific purpose (introduce topic, highlight key point, transition, call-to-action, etc.)
+3. Be relevant to the content being discussed at that timestamp
+
+Return ONLY valid JSON (no markdown):
+{
+  "animations": [
+    {
+      "type": "intro" | "highlight" | "transition" | "callout" | "outro",
+      "startTime": <seconds where animation should appear>,
+      "duration": <animation duration in seconds, typically 3-5>,
+      "title": "<short title for the animation>",
+      "description": "<detailed description of what the animation should show, including specific text, colors, style>",
+      "relevantContent": "<what the video is discussing at this point>"
+    }
+  ]
+}
+
+Guidelines:
+- First animation should typically be an intro (startTime: 0)
+- Last animation could be an outro or call-to-action
+- Space animations throughout the video, not clustered together
+- Each animation should enhance understanding or engagement
+- Be specific about visual style, colors, and text content`
+        }]
+      }],
+    });
+
+    let animationPlan;
+    try {
+      const planText = planResult.candidates[0].content.parts[0].text;
+      const cleanedPlan = planText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      animationPlan = JSON.parse(cleanedPlan);
+    } catch (parseError) {
+      console.error(`[${jobId}] Failed to parse animation plan:`, parseError);
+      throw new Error('Failed to parse AI animation plan');
+    }
+
+    console.log(`[${jobId}] Planned ${animationPlan.animations.length} animations`);
+    animationPlan.animations.forEach((a, i) => {
+      console.log(`[${jobId}]   ${i + 1}. ${a.type} at ${a.startTime}s: ${a.title}`);
+    });
+
+    // Step 3: Generate each animation
+    console.log(`[${jobId}] Step 3: Generating animations...`);
+    const generatedAnimations = [];
+
+    for (let i = 0; i < animationPlan.animations.length; i++) {
+      const plan = animationPlan.animations[i];
+      console.log(`[${jobId}] Generating animation ${i + 1}/${animationPlan.animations.length}: ${plan.title}`);
+
+      const assetId = randomUUID();
+      const outputPath = join(session.assetsDir, `${assetId}.mp4`);
+      const thumbPath = join(session.assetsDir, `${assetId}_thumb.jpg`);
+      const propsPath = join(session.dir, `${jobId}-batch-${i}-props.json`);
+      const sceneDataPath = join(session.dir, `${assetId}-scenes.json`);
+
+      // Generate scene data with Gemini
+      const sceneResult = await ai.models.generateContent({
+        model: 'gemini-2.0-flash',
+        contents: [{
+          role: 'user',
+          parts: [{
+            text: `Create a Remotion animation for this video moment.
+
+ANIMATION TYPE: ${plan.type}
+TITLE: ${plan.title}
+DESCRIPTION: ${plan.description}
+CONTEXT: ${plan.relevantContent}
+DURATION: ${plan.duration} seconds (${plan.duration * fps} frames)
+
+Generate a scene-based animation. Return ONLY valid JSON:
+{
+  "scenes": [
+    {
+      "id": "scene-1",
+      "type": "title" | "bullets" | "stats" | "quote" | "callToAction" | "transition",
+      "duration": <frames>,
+      "content": {
+        "title": "optional title text",
+        "subtitle": "optional subtitle",
+        "items": [{"label": "item text", "icon": "optional emoji"}],
+        "stats": [{"value": "100%", "label": "stat name"}],
+        "quote": "quote text",
+        "author": "quote author",
+        "buttonText": "CTA text",
+        "backgroundColor": "#hex",
+        "textColor": "#hex",
+        "accentColor": "#hex"
+      }
+    }
+  ],
+  "totalDuration": <total frames>,
+  "backgroundColor": "#1a1a2e"
+}
+
+Make it visually engaging with good color choices. Use 2-4 scenes for variety.`
+          }]
+        }],
+      });
+
+      let sceneData;
+      try {
+        const sceneText = sceneResult.candidates[0].content.parts[0].text;
+        const cleanedScene = sceneText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+        sceneData = JSON.parse(cleanedScene);
+      } catch (parseError) {
+        console.error(`[${jobId}] Failed to parse scene data for animation ${i + 1}, using fallback`);
+        // Create a simple fallback animation
+        sceneData = {
+          scenes: [{
+            id: 'scene-1',
+            type: 'title',
+            duration: plan.duration * fps,
+            content: {
+              title: plan.title,
+              subtitle: plan.description.substring(0, 50),
+              backgroundColor: '#1a1a2e',
+              textColor: '#ffffff',
+              accentColor: '#6366f1'
+            }
+          }],
+          totalDuration: plan.duration * fps,
+          backgroundColor: '#1a1a2e'
+        };
+      }
+
+      // Save scene data
+      writeFileSync(sceneDataPath, JSON.stringify(sceneData, null, 2));
+      writeFileSync(propsPath, JSON.stringify(sceneData, null, 2));
+
+      const totalDuration = sceneData.totalDuration || sceneData.scenes.reduce((sum, s) => sum + s.duration, 0);
+      const durationInSeconds = totalDuration / fps;
+
+      // Render with Remotion
+      const remotionArgs = [
+        'remotion', 'render',
+        'src/remotion/index.tsx',
+        'DynamicAnimation',
+        outputPath,
+        '--props', propsPath,
+        '--frames', `0-${totalDuration - 1}`,
+        '--fps', String(fps),
+        '--width', String(width),
+        '--height', String(height),
+        '--codec', 'h264',
+        '--overwrite',
+        '--gl=swangle', // Software WebGL for headless rendering
+      ];
+
+      await new Promise((resolve, reject) => {
+        const proc = spawn('npx', remotionArgs, {
+          cwd: process.cwd(),
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+
+        let stderr = '';
+        proc.stderr.on('data', (data) => {
+          stderr += data.toString();
+        });
+
+        proc.on('close', (code) => {
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(new Error(`Remotion render failed: ${stderr.substring(0, 200)}`));
+          }
+        });
+
+        proc.on('error', (err) => {
+          reject(new Error(`Failed to start Remotion: ${err.message}`));
+        });
+      });
+
+      // Generate thumbnail
+      try {
+        await runFFmpeg([
+          '-y', '-i', outputPath,
+          '-vf', 'scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2',
+          '-frames:v', '1',
+          thumbPath
+        ], jobId);
+      } catch (e) {
+        console.warn(`[${jobId}] Thumbnail failed for animation ${i + 1}`);
+      }
+
+      // Clean up props file
+      try { unlinkSync(propsPath); } catch (e) {}
+
+      const { stat } = await import('fs/promises');
+      const stats = await stat(outputPath);
+
+      // Create asset entry
+      const asset = {
+        id: assetId,
+        type: 'video',
+        filename: `${plan.type}-${plan.title.replace(/[^a-zA-Z0-9]/g, '-').substring(0, 20)}.mp4`,
+        path: outputPath,
+        thumbPath: existsSync(thumbPath) ? thumbPath : null,
+        duration: durationInSeconds,
+        size: stats.size,
+        width,
+        height,
+        createdAt: Date.now(),
+        aiGenerated: true,
+        sceneData,
+        sceneDataPath,
+        description: plan.description,
+      };
+
+      session.assets.set(assetId, asset);
+
+      generatedAnimations.push({
+        assetId,
+        filename: asset.filename,
+        duration: durationInSeconds,
+        startTime: plan.startTime,
+        type: plan.type,
+        title: plan.title,
+        thumbnailUrl: `/session/${sessionId}/assets/${assetId}/thumbnail`,
+        streamUrl: `/session/${sessionId}/assets/${assetId}/stream`,
+      });
+
+      console.log(`[${jobId}] ✓ Animation ${i + 1} complete: ${asset.filename}`);
+    }
+
+    console.log(`[${jobId}] === BATCH GENERATION COMPLETE ===`);
+    console.log(`[${jobId}] Generated ${generatedAnimations.length} animations\n`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      animations: generatedAnimations,
+      videoDuration: videoAsset.duration,
+    }));
+
+  } catch (error) {
+    console.error('Batch animation generation error:', error);
     res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({ error: error.message }));
   }
@@ -4421,9 +6082,48 @@ async function handleAnalyzeForAnimation(req, res, sessionId) {
     const hasLocalWhisper = await checkLocalWhisper();
     const openaiKey = process.env.OPENAI_API_KEY;
 
+    // Helper function to transcribe with Gemini (always available as fallback)
+    const transcribeWithGemini = async () => {
+      console.log(`[${jobId}]    Using Gemini for transcription...`);
+      const ai = new GoogleGenAI({ apiKey });
+      const audioBuffer = readFileSync(audioPath);
+      const fileSizeKB = audioBuffer.length / 1024;
+      console.log(`[${jobId}]    Audio file size: ${fileSizeKB.toFixed(1)}KB`);
+
+      // Check if audio file is too small (likely no audio track in video)
+      if (audioBuffer.length < 1000) {
+        console.log(`[${jobId}]    Audio file too small, video may have no audio track`);
+        return { text: '', words: [] };
+      }
+
+      const audioBase64 = audioBuffer.toString('base64');
+
+      const result = await ai.models.generateContent({
+        model: 'gemini-2.0-flash',
+        contents: [{
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
+            { text: `Transcribe this audio. Return ONLY the text content. Duration: ${analyzedDuration.toFixed(1)}s` }
+          ]
+        }],
+      });
+
+      return {
+        text: result.candidates?.[0]?.content?.parts?.[0]?.text || '',
+        words: [],
+      };
+    };
+
     if (hasLocalWhisper) {
-      console.log(`[${jobId}]    Using local Whisper...`);
-      transcription = await runLocalWhisper(audioPath, jobId);
+      try {
+        console.log(`[${jobId}]    Using local Whisper...`);
+        transcription = await runLocalWhisper(audioPath, jobId);
+      } catch (whisperError) {
+        console.log(`[${jobId}]    Local Whisper failed: ${whisperError.message}`);
+        console.log(`[${jobId}]    Falling back to Gemini...`);
+        transcription = await transcribeWithGemini();
+      }
     } else if (openaiKey) {
       console.log(`[${jobId}]    Using OpenAI Whisper API...`);
       const FormData = (await import('node-fetch')).default.FormData || global.FormData;
@@ -4454,26 +6154,7 @@ async function handleAnalyzeForAnimation(req, res, sessionId) {
       };
     } else {
       // Use Gemini as fallback
-      console.log(`[${jobId}]    Using Gemini for transcription...`);
-      const ai = new GoogleGenAI({ apiKey });
-      const audioBuffer = readFileSync(audioPath);
-      const audioBase64 = audioBuffer.toString('base64');
-
-      const result = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
-        contents: [{
-          role: 'user',
-          parts: [
-            { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
-            { text: `Transcribe this audio. Return ONLY the text content. Duration: ${analyzedDuration.toFixed(1)}s` }
-          ]
-        }],
-      });
-
-      transcription = {
-        text: result.candidates[0].content.parts[0].text || '',
-        words: [],
-      };
+      transcription = await transcribeWithGemini();
     }
 
     console.log(`[${jobId}] Transcription complete: ${transcription.text.substring(0, 100)}...`);
@@ -4534,15 +6215,20 @@ Based on the video content above, return ONLY valid JSON (no markdown) with this
   "scenes": [
     {
       "id": "unique-id",
-      "type": "title" | "steps" | "features" | "stats" | "text" | "transition",
+      "type": "title" | "steps" | "features" | "stats" | "text" | "transition" | "gif" | "emoji",
       "duration": <frames at 30fps>,
       "content": {
         "title": "text derived from video content",
         "subtitle": "optional",
         "items": [{"icon": "emoji", "label": "text", "description": "optional"}],
-        "stats": [{"value": "number", "label": "text"}],
+        "stats": [{"value": "number", "label": "text", "numericValue": <integer for counting>}],
         "color": "#hex accent color",
-        "backgroundColor": "#hex or null for transparent"
+        "backgroundColor": "#hex or null for transparent",
+        // For gif scenes - use GIPHY search:
+        "gifSearch": "keyword to search for GIF",
+        "gifLayout": "fullscreen" | "scattered",
+        // For emoji scenes:
+        "emojis": [{"emoji": "🔥", "x": 50, "y": 50, "scale": 0.2, "animation": "bounce"}]
       }
     }
   ],
@@ -4552,8 +6238,14 @@ Based on the video content above, return ONLY valid JSON (no markdown) with this
   "keyTopics": ["topic1", "topic2", "topic3"]
 }
 
+Scene type notes:
+- "gif": Use "gifSearch" to search GIPHY for GIFs (e.g., "mind blown", "celebration", "thumbs up")
+- "emoji": Animated emoji scene with animations (pop, bounce, float, pulse)
+- "stats": Use numericValue for counting animation (must be a NUMBER)
+
 IMPORTANT: The animation content should directly relate to the video's actual topic and message.
-Use specific terms, concepts, and themes from the transcript.`;
+Use specific terms, concepts, and themes from the transcript.
+Feel free to add a GIF scene for reactions or emphasis when appropriate!`;
 
     const sceneResult = await genAI.models.generateContent({
       model: 'gemini-2.0-flash',
@@ -4571,6 +6263,46 @@ Use specific terms, concepts, and themes from the transcript.`;
     } catch (parseError) {
       console.error(`[${jobId}] Failed to parse Gemini response:`, parseError);
       throw new Error('Failed to parse AI-generated scene data');
+    }
+
+    // Post-process GIF scenes - search GIPHY and inject actual URLs
+    const giphyKeyForAnalysis = process.env.GIPHY_API_KEY;
+    for (const scene of sceneData.scenes) {
+      if (scene.type === 'gif' && scene.content) {
+        const { gifSearch, gifSearches } = scene.content;
+        const searchTerms = gifSearches || (gifSearch ? [gifSearch] : []);
+
+        if (searchTerms.length > 0 && giphyKeyForAnalysis) {
+          console.log(`[${jobId}] 🎬 Fetching GIFs from GIPHY for concept: ${searchTerms.join(', ')}`);
+          scene.content.gifs = [];
+
+          for (const term of searchTerms) {
+            try {
+              const gifs = await searchGiphy(term, 1);
+              if (gifs.length > 0) {
+                const gif = gifs[0];
+                const gifUrl = gif.images?.fixed_height?.url || gif.images?.original?.url;
+                if (gifUrl) {
+                  scene.content.gifs.push({
+                    src: gifUrl,
+                    width: parseInt(gif.images?.fixed_height?.width) || 400,
+                    height: parseInt(gif.images?.fixed_height?.height) || 300,
+                    title: gif.title || term,
+                    searchTerm: term,
+                  });
+                  console.log(`[${jobId}]    ✓ Found GIF for "${term}"`);
+                }
+              }
+            } catch (err) {
+              console.log(`[${jobId}]    ✗ GIPHY search failed: ${err.message}`);
+            }
+          }
+
+          if (!scene.content.gifLayout && scene.content.gifs.length === 1) {
+            scene.content.gifLayout = 'fullscreen';
+          }
+        }
+      }
     }
 
     const animationTotalDuration = sceneData.totalDuration || sceneData.scenes.reduce((sum, s) => sum + s.duration, 0);
@@ -4644,6 +6376,47 @@ async function handleRenderFromConcept(req, res, sessionId) {
       keyTopics: concept.keyTopics,
     };
 
+    // Post-process GIF scenes - search GIPHY for any unresolved gif searches
+    const giphyKeyForRender = process.env.GIPHY_API_KEY;
+    for (const scene of sceneData.scenes) {
+      if (scene.type === 'gif' && scene.content) {
+        const { gifSearch, gifSearches, gifs } = scene.content;
+        const searchTerms = gifSearches || (gifSearch ? [gifSearch] : []);
+
+        // Only search if we have search terms but no resolved GIFs
+        if (searchTerms.length > 0 && (!gifs || gifs.length === 0) && giphyKeyForRender) {
+          console.log(`[${jobId}] 🎬 Resolving GIPHY searches: ${searchTerms.join(', ')}`);
+          scene.content.gifs = [];
+
+          for (const term of searchTerms) {
+            try {
+              const gifsResult = await searchGiphy(term, 1);
+              if (gifsResult.length > 0) {
+                const gif = gifsResult[0];
+                const gifUrl = gif.images?.fixed_height?.url || gif.images?.original?.url;
+                if (gifUrl) {
+                  scene.content.gifs.push({
+                    src: gifUrl,
+                    width: parseInt(gif.images?.fixed_height?.width) || 400,
+                    height: parseInt(gif.images?.fixed_height?.height) || 300,
+                    title: gif.title || term,
+                    searchTerm: term,
+                  });
+                  console.log(`[${jobId}]    ✓ Resolved GIF for "${term}"`);
+                }
+              }
+            } catch (err) {
+              console.log(`[${jobId}]    ✗ GIPHY search failed: ${err.message}`);
+            }
+          }
+
+          if (!scene.content.gifLayout && scene.content.gifs.length === 1) {
+            scene.content.gifLayout = 'fullscreen';
+          }
+        }
+      }
+    }
+
     // Save scene data for future editing (reusable path based on asset ID)
     const sceneDataPath = join(session.dir, `${assetId}-scenes.json`);
     writeFileSync(sceneDataPath, JSON.stringify(sceneData, null, 2));
@@ -4672,6 +6445,7 @@ async function handleRenderFromConcept(req, res, sessionId) {
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
+      '--gl=swangle', // Software WebGL for headless rendering
     ];
 
     console.log(`[${jobId}] Remotion command: npx ${remotionArgs.join(' ')}`);
@@ -4745,6 +6519,7 @@ async function handleRenderFromConcept(req, res, sessionId) {
     };
 
     session.assets.set(assetId, asset);
+    saveAssetMetadata(session); // Persist AI-generated flag to disk
 
     console.log(`[${jobId}] Animation rendered: ${assetId} (${durationInSeconds}s)`);
     console.log(`[${jobId}] === RENDER COMPLETE ===\n`);
@@ -4824,10 +6599,38 @@ async function handleGenerateTranscriptAnimation(req, res, sessionId) {
     const hasLocalWhisper = await checkLocalWhisper();
     const openaiKey = process.env.OPENAI_API_KEY;
 
+    // Helper for Gemini fallback
+    const transcribeWithGeminiForAnimation = async () => {
+      console.log(`[${jobId}]    Using Gemini for transcription...`);
+      const audioBuffer = readFileSync(audioPath);
+      const audioBase64 = audioBuffer.toString('base64');
+      const ai = new GoogleGenAI({ apiKey });
+      const geminiResponse = await ai.models.generateContent({
+        model: 'gemini-2.0-flash',
+        contents: [{ role: 'user', parts: [
+          { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
+          { text: `Transcribe this audio with word timestamps. Duration: ${totalDuration}s. Return JSON: {"text": "...", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
+        ]}]
+      });
+      const respText = geminiResponse.text || '';
+      try {
+        return JSON.parse(respText);
+      } catch {
+        const match = respText.match(/\{[\s\S]*\}/);
+        return match ? JSON.parse(match[0]) : { text: respText, words: [] };
+      }
+    };
+
     let transcription;
     if (hasLocalWhisper) {
-      console.log(`[${jobId}]    Using local Whisper...`);
-      transcription = await runLocalWhisper(audioPath, jobId);
+      try {
+        console.log(`[${jobId}]    Using local Whisper...`);
+        transcription = await runLocalWhisper(audioPath, jobId);
+      } catch (whisperError) {
+        console.log(`[${jobId}]    Local Whisper failed: ${whisperError.message}`);
+        console.log(`[${jobId}]    Falling back to Gemini...`);
+        transcription = await transcribeWithGeminiForAnimation();
+      }
     } else if (openaiKey) {
       console.log(`[${jobId}]    Using OpenAI Whisper API...`);
       const audioBuffer = readFileSync(audioPath);
@@ -4860,30 +6663,7 @@ async function handleGenerateTranscriptAnimation(req, res, sessionId) {
         }))
       };
     } else {
-      // Use Gemini for transcription
-      console.log(`[${jobId}]    Using Gemini for transcription...`);
-      const audioBuffer = readFileSync(audioPath);
-      const audioBase64 = audioBuffer.toString('base64');
-
-      const ai = new GoogleGenAI({ apiKey });
-      const geminiResponse = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
-        contents: [{
-          role: 'user',
-          parts: [
-            { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
-            { text: `Transcribe this audio with word timestamps. Duration: ${totalDuration}s. Return JSON: {"text": "...", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
-          ]
-        }]
-      });
-
-      const respText = geminiResponse.text || '';
-      try {
-        transcription = JSON.parse(respText);
-      } catch {
-        const match = respText.match(/\{[\s\S]*\}/);
-        transcription = match ? JSON.parse(match[0]) : { text: respText, words: [] };
-      }
+      transcription = await transcribeWithGeminiForAnimation();
     }
 
     try { unlinkSync(audioPath); } catch {}
@@ -5023,6 +6803,7 @@ Pick phrases that are spread throughout the video. Each phrase should be 2-6 wor
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
+      '--gl=swangle', // Software WebGL for headless rendering
     ];
 
     console.log(`[${jobId}] Remotion command: npx ${remotionArgs.join(' ')}`);
@@ -5084,6 +6865,7 @@ Pick phrases that are spread throughout the video. Each phrase should be 2-6 wor
     };
 
     session.assets.set(assetId, asset);
+    saveAssetMetadata(session); // Persist AI-generated flag to disk
 
     console.log(`[${jobId}] Transcript animation created: ${assetId}`);
     console.log(`[${jobId}] === TRANSCRIPT ANIMATION COMPLETE ===\n`);
@@ -5182,9 +6964,39 @@ async function handleGenerateContextualAnimation(req, res, sessionId) {
     const hasLocalWhisper = await checkLocalWhisper();
     const openaiKey = process.env.OPENAI_API_KEY;
 
+    // Helper for Gemini fallback in contextual animation
+    const transcribeWithGeminiContextual = async () => {
+      console.log(`[${jobId}]    Using Gemini for transcription...`);
+      const ai = new GoogleGenAI({ apiKey });
+      const audioBuffer = readFileSync(audioPath);
+      const audioBase64 = audioBuffer.toString('base64');
+
+      const result = await ai.models.generateContent({
+        model: 'gemini-2.0-flash',
+        contents: [{
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
+            { text: `Transcribe this audio. Return ONLY the text content, no timestamps needed. Duration: ${totalDuration.toFixed(1)}s` }
+          ]
+        }],
+      });
+
+      return {
+        text: result.candidates[0].content.parts[0].text || '',
+        words: [],
+      };
+    };
+
     if (hasLocalWhisper) {
-      console.log(`[${jobId}]    Using local Whisper...`);
-      transcription = await runLocalWhisper(audioPath, jobId);
+      try {
+        console.log(`[${jobId}]    Using local Whisper...`);
+        transcription = await runLocalWhisper(audioPath, jobId);
+      } catch (whisperError) {
+        console.log(`[${jobId}]    Local Whisper failed: ${whisperError.message}`);
+        console.log(`[${jobId}]    Falling back to Gemini...`);
+        transcription = await transcribeWithGeminiContextual();
+      }
     } else if (openaiKey) {
       console.log(`[${jobId}]    Using OpenAI Whisper API...`);
       const FormData = (await import('node-fetch')).default.FormData || global.FormData;
@@ -5214,29 +7026,7 @@ async function handleGenerateContextualAnimation(req, res, sessionId) {
         })),
       };
     } else {
-      // Use Gemini as fallback for transcription
-      console.log(`[${jobId}]    Using Gemini for transcription...`);
-      const ai = new GoogleGenAI({ apiKey });
-
-      // Read audio file as base64
-      const audioBuffer = readFileSync(audioPath);
-      const audioBase64 = audioBuffer.toString('base64');
-
-      const result = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
-        contents: [{
-          role: 'user',
-          parts: [
-            { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
-            { text: `Transcribe this audio. Return ONLY the text content, no timestamps needed. Duration: ${totalDuration.toFixed(1)}s` }
-          ]
-        }],
-      });
-
-      transcription = {
-        text: result.candidates[0].content.parts[0].text || '',
-        words: [],
-      };
+      transcription = await transcribeWithGeminiContextual();
     }
 
     console.log(`[${jobId}] Transcription complete: ${transcription.text.substring(0, 100)}...`);
@@ -5332,6 +7122,14 @@ Use specific terms, concepts, and themes from the transcript.`;
     console.log(`[${jobId}] Generated ${sceneData.scenes.length} scenes for ${type}`);
     console.log(`[${jobId}] Content summary: ${sceneData.contentSummary || 'N/A'}`);
 
+    // Log camera movements for debugging
+    const scenesWithCamera = sceneData.scenes.filter(s => s.content?.camera?.type);
+    if (scenesWithCamera.length > 0) {
+      console.log(`[${jobId}] 🎥 Camera movements: ${scenesWithCamera.map(s => `${s.id}: ${s.content.camera.type}`).join(', ')}`);
+    } else {
+      console.log(`[${jobId}] ⚠️ No camera movements in any scene`);
+    }
+
     const animationTotalDuration = sceneData.totalDuration || sceneData.scenes.reduce((sum, s) => sum + s.duration, 0);
     const durationInSeconds = animationTotalDuration / fps;
 
@@ -5357,6 +7155,7 @@ Use specific terms, concepts, and themes from the transcript.`;
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
+      '--gl=swangle', // Software WebGL for headless rendering
     ];
 
     await new Promise((resolve, reject) => {
@@ -5450,6 +7249,160 @@ Use specific terms, concepts, and themes from the transcript.`;
 
   } catch (error) {
     console.error('Contextual animation generation error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Extract audio from video - creates separate audio asset and mutes the video
+async function handleExtractAudio(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  try {
+    const body = await parseBody(req);
+    const { assetId } = body;
+
+    if (!assetId) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'assetId is required' }));
+      return;
+    }
+
+    const videoAsset = session.assets.get(assetId);
+    if (!videoAsset) {
+      res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Asset not found' }));
+      return;
+    }
+
+    if (videoAsset.type !== 'video') {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Asset must be a video' }));
+      return;
+    }
+
+    const jobId = sessionId.substring(0, 8);
+    console.log(`\n[${jobId}] === EXTRACT AUDIO ===`);
+    console.log(`[${jobId}] Source video: ${videoAsset.filename}`);
+
+    // Generate IDs and paths
+    const audioAssetId = randomUUID();
+    const mutedVideoAssetId = randomUUID();
+    const audioPath = join(session.assetsDir, `${audioAssetId}.mp3`);
+    const mutedVideoPath = join(session.assetsDir, `${mutedVideoAssetId}.mp4`);
+    const mutedThumbPath = join(session.assetsDir, `${mutedVideoAssetId}_thumb.jpg`);
+
+    // Step 1: Extract audio from video
+    console.log(`[${jobId}] Step 1: Extracting audio...`);
+    await runFFmpeg([
+      '-y', '-i', videoAsset.path,
+      '-vn',                    // No video
+      '-acodec', 'libmp3lame',  // MP3 codec
+      '-q:a', '2',              // High quality
+      audioPath
+    ], jobId);
+
+    // Step 2: Create muted version of video
+    console.log(`[${jobId}] Step 2: Creating muted video...`);
+    await runFFmpeg([
+      '-y', '-i', videoAsset.path,
+      '-an',                    // No audio
+      '-c:v', 'copy',           // Copy video stream (fast)
+      mutedVideoPath
+    ], jobId);
+
+    // Step 3: Generate thumbnail for muted video
+    try {
+      await runFFmpeg([
+        '-y', '-i', mutedVideoPath,
+        '-vf', 'scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2',
+        '-frames:v', '1',
+        mutedThumbPath
+      ], jobId);
+    } catch (e) {
+      console.warn(`[${jobId}] Thumbnail generation failed:`, e.message);
+    }
+
+    // Get file stats
+    const { stat } = await import('fs/promises');
+    const audioStats = await stat(audioPath);
+    const videoStats = await stat(mutedVideoPath);
+
+    // Get audio duration
+    let audioDuration = videoAsset.duration;
+    try {
+      const durationStr = execSync(
+        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`,
+        { encoding: 'utf-8' }
+      ).trim();
+      audioDuration = parseFloat(durationStr) || videoAsset.duration;
+    } catch (e) {
+      console.warn(`[${jobId}] Could not get audio duration:`, e.message);
+    }
+
+    // Create audio asset
+    const audioAsset = {
+      id: audioAssetId,
+      type: 'audio',
+      filename: `${videoAsset.filename.replace(/\.[^.]+$/, '')}-audio.mp3`,
+      path: audioPath,
+      thumbPath: null,
+      duration: audioDuration,
+      size: audioStats.size,
+      createdAt: Date.now(),
+      sourceAssetId: assetId,
+    };
+    session.assets.set(audioAssetId, audioAsset);
+
+    // Create muted video asset
+    const mutedAsset = {
+      id: mutedVideoAssetId,
+      type: 'video',
+      filename: `${videoAsset.filename.replace(/\.[^.]+$/, '')}-muted.mp4`,
+      path: mutedVideoPath,
+      thumbPath: existsSync(mutedThumbPath) ? mutedThumbPath : videoAsset.thumbPath,
+      duration: videoAsset.duration,
+      size: videoStats.size,
+      width: videoAsset.width || 1920,
+      height: videoAsset.height || 1080,
+      createdAt: Date.now(),
+      sourceAssetId: assetId,
+      isMuted: true,
+    };
+    session.assets.set(mutedVideoAssetId, mutedAsset);
+
+    console.log(`[${jobId}] ✓ Audio extracted: ${audioAsset.filename} (${audioDuration.toFixed(2)}s)`);
+    console.log(`[${jobId}] ✓ Muted video created: ${mutedAsset.filename}`);
+    console.log(`[${jobId}] === EXTRACT AUDIO COMPLETE ===\n`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      audioAsset: {
+        id: audioAssetId,
+        filename: audioAsset.filename,
+        duration: audioDuration,
+        type: 'audio',
+        streamUrl: `/session/${sessionId}/assets/${audioAssetId}/stream`,
+      },
+      mutedVideoAsset: {
+        id: mutedVideoAssetId,
+        filename: mutedAsset.filename,
+        duration: mutedAsset.duration,
+        type: 'video',
+        streamUrl: `/session/${sessionId}/assets/${mutedVideoAssetId}/stream`,
+        thumbnailUrl: `/session/${sessionId}/assets/${mutedVideoAssetId}/thumbnail`,
+      },
+      originalAssetId: assetId,
+    }));
+
+  } catch (error) {
+    console.error('Extract audio error:', error);
     res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({ error: error.message }));
   }
@@ -5710,10 +7663,41 @@ const server = http.createServer(async (req, res) => {
     else if (req.method === 'POST' && action === 'generate-image') {
       await handleGenerateImage(req, res, sessionId);
     }
+    // Generate batch animations across timeline
+    else if (req.method === 'POST' && action === 'generate-batch-animations') {
+      await handleGenerateBatchAnimations(req, res, sessionId);
+    }
     // Process asset with FFmpeg command
     else if (req.method === 'POST' && action === 'process-asset') {
       await handleProcessAsset(req, res, sessionId);
-    } else if (action.startsWith('renders/')) {
+    }
+    // Extract audio from video (creates audio asset + muted video)
+    else if (req.method === 'POST' && action === 'extract-audio') {
+      await handleExtractAudio(req, res, sessionId);
+    }
+    // Generate video from image (DiCaprio agent)
+    else if (req.method === 'POST' && action === 'generate-video') {
+      await handleGenerateVideo(req, res, sessionId);
+    }
+    // Restyle video with AI (DiCaprio agent - LTX-2)
+    else if (req.method === 'POST' && action === 'restyle-video') {
+      await handleRestyleVideo(req, res, sessionId);
+    }
+    // Remove video background (DiCaprio agent - Bria)
+    else if (req.method === 'POST' && action === 'remove-video-bg') {
+      await handleRemoveVideoBg(req, res, sessionId);
+    }
+    // GIPHY search endpoints
+    else if (req.method === 'GET' && action === 'giphy/search') {
+      await handleGiphySearch(req, res, sessionId, url);
+    }
+    else if (req.method === 'GET' && action === 'giphy/trending') {
+      await handleGiphyTrending(req, res, sessionId, url);
+    }
+    else if (req.method === 'POST' && action === 'giphy/add') {
+      await handleGiphyAdd(req, res, sessionId);
+    }
+    else if (action.startsWith('renders/')) {
       const renderType = action.substring(8); // Remove 'renders/'
       if (req.method === 'GET') {
         await handleRenderDownload(req, res, sessionId, renderType);

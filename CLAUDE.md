@@ -87,12 +87,16 @@ Motion graphics use Remotion 4.x. When working on templates in `src/remotion/`:
 
 Required in `.dev.vars` for local development:
 - `GEMINI_API_KEY` - Google AI for editing commands
-- `FAL_API_KEY` - fal.ai for Picasso image generation (nano-banana-pro model)
+- `FAL_API_KEY` - fal.ai for Picasso image generation (nano-banana-pro) and DiCaprio video generation (Kling v1.5)
 - `GIPHY_API_KEY` - GIF search
 - `OPENAI_API_KEY` - Additional AI features
 
 ## AI Agents
 
-The right panel has two AI agents accessible via tabs:
+The right panel has three AI agents accessible via tabs:
 - **Director** (AIPromptPanel): Video editing commands, captions, motion graphics, animations
 - **Picasso** (PicassoPanel): Image generation using fal.ai nano-banana-pro model - generates images that are automatically added to the asset library
+- **DiCaprio** (DiCaprioPanel): Video generation and editing with three skills:
+  - **Animate Image**: Image-to-video using fal.ai Kling v1.5 - transforms static images into dynamic videos
+  - **Restyle Video**: Video-to-video style transfer using fal.ai LTX-2 19B - apply new visual styles to existing videos
+  - **Remove Background**: Video background removal using fal.ai Bria - isolate subjects from video backgrounds

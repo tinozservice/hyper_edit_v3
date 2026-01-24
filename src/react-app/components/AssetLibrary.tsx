@@ -1,5 +1,5 @@
 import { useRef, useCallback } from 'react';
-import { Film, Image, Music, Upload, Trash2, Plus, Sparkles } from 'lucide-react';
+import { Film, Image, Music, Upload, Trash2, Plus, Sparkles, ImageIcon } from 'lucide-react';
 import type { Asset } from '@/react-app/hooks/useProject';
 
 interface AssetLibraryProps {
@@ -10,6 +10,7 @@ interface AssetLibraryProps {
   onSelect?: (assetId: string | null) => void;
   selectedAssetId?: string | null;
   uploading?: boolean;
+  onOpenGifSearch?: () => void;
 }
 
 const getAssetIcon = (type: Asset['type']) => {
@@ -51,6 +52,7 @@ export default function AssetLibrary({
   onSelect,
   selectedAssetId,
   uploading = false,
+  onOpenGifSearch,
 }: AssetLibraryProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -89,14 +91,25 @@ export default function AssetLibrary({
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-zinc-800/50">
         <span className="text-xs font-medium text-zinc-400">Assets</span>
-        <button
-          onClick={handleFileSelect}
-          disabled={uploading}
-          className="p-1.5 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 disabled:cursor-not-allowed rounded text-xs transition-colors"
-          title="Import files"
-        >
-          <Plus className="w-3.5 h-3.5" />
-        </button>
+        <div className="flex items-center gap-1.5">
+          {onOpenGifSearch && (
+            <button
+              onClick={onOpenGifSearch}
+              className="p-1.5 bg-purple-600 hover:bg-purple-500 rounded text-xs transition-colors"
+              title="Search GIFs & Memes"
+            >
+              <ImageIcon className="w-3.5 h-3.5" />
+            </button>
+          )}
+          <button
+            onClick={handleFileSelect}
+            disabled={uploading}
+            className="p-1.5 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 disabled:cursor-not-allowed rounded text-xs transition-colors"
+            title="Import files"
+          >
+            <Plus className="w-3.5 h-3.5" />
+          </button>
+        </div>
       </div>
 
       {/* Hidden file input */}

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus } from 'lucide-react';
+import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move } from 'lucide-react';
 import type { TimelineClip, Track, Asset } from '@/react-app/hooks/useProject';
 import { MOTION_TEMPLATES, type TemplateId } from '@/remotion/templates';
 import MotionGraphicsPanel from './MotionGraphicsPanel';
@@ -83,6 +83,29 @@ interface CustomAnimationResult {
   duration: number;
 }
 
+interface BatchAnimationResult {
+  assetId: string;
+  filename: string;
+  duration: number;
+  startTime: number;
+  type: 'intro' | 'highlight' | 'transition' | 'callout' | 'outro';
+  title: string;
+}
+
+interface ExtractAudioResult {
+  audioAsset: {
+    id: string;
+    filename: string;
+    duration: number;
+  };
+  mutedVideoAsset: {
+    id: string;
+    filename: string;
+    duration: number;
+  };
+  originalAssetId: string;
+}
+
 interface ContextualAnimationRequest {
   type: 'intro' | 'outro' | 'transition' | 'highlight';
   description?: string;
@@ -148,12 +171,14 @@ interface AIPromptPanelProps {
   onRemoveDeadAir?: () => Promise<{ duration: number; removedDuration: number }>;
   onChapterCuts?: () => Promise<ChapterCutResult>;
   onAddMotionGraphic?: (config: MotionGraphicConfig) => Promise<void>;
-  onCreateCustomAnimation?: (description: string, startTime?: number, endTime?: number, attachedAssetIds?: string[]) => Promise<CustomAnimationResult>;
+  onCreateCustomAnimation?: (description: string, startTime?: number, endTime?: number, attachedAssetIds?: string[], durationSeconds?: number) => Promise<CustomAnimationResult>;
   onUploadAttachment?: (file: File) => Promise<Asset>;
   onAnalyzeForAnimation?: (request: ContextualAnimationRequest) => Promise<{ concept: AnimationConcept }>;
   onRenderFromConcept?: (concept: AnimationConcept) => Promise<CustomAnimationResult>;
   onCreateContextualAnimation?: (request: ContextualAnimationRequest) => Promise<CustomAnimationResult>;
   onGenerateTranscriptAnimation?: () => Promise<CustomAnimationResult>;
+  onGenerateBatchAnimations?: (count: number) => Promise<{ animations: BatchAnimationResult[]; videoDuration: number }>;
+  onExtractAudio?: () => Promise<ExtractAudioResult>;
   onOpenAnimationInTab?: (assetId: string, animationName: string) => string | undefined;
   onEditAnimation?: (assetId: string, editPrompt: string, v1Context?: EditTabV1Context, tabIdToUpdate?: string) => Promise<{ assetId: string; duration: number; sceneCount: number }>;
   isApplying?: boolean;
@@ -186,6 +211,8 @@ export default function AIPromptPanel({
   onRenderFromConcept,
   onCreateContextualAnimation: _onCreateContextualAnimation,
   onGenerateTranscriptAnimation,
+  onGenerateBatchAnimations,
+  onExtractAudio,
   onOpenAnimationInTab,
   onEditAnimation,
   isApplying,
@@ -349,19 +376,43 @@ export default function AIPromptPanel({
     setTimeRangeInputs({ start: '', end: '' });
   };
 
-  // Add a reference
+  // Add a reference (or attach asset for animation if it's an image/video)
   const addReference = (ref: TimelineReference) => {
-    // Don't add duplicates
+    setShowReferencePicker(false);
+
+    // For image/video assets, add as attachment for Remotion animations instead of reference
+    if (ref.type === 'clip') {
+      const asset = assets.find(a => a.id === ref.id);
+      if (asset && (asset.type === 'image' || asset.type === 'video')) {
+        // Don't add duplicate attachments
+        if (!attachedAssets.some(a => a.id === asset.id)) {
+          setAttachedAssets(prev => [...prev, {
+            id: asset.id,
+            filename: asset.filename,
+            type: asset.type as 'image' | 'video',
+            thumbnailUrl: asset.thumbnailUrl,
+          }]);
+        }
+        return; // Don't add to selectedReferences - attachment tag is enough
+      }
+    }
+
+    // For other reference types (audio, etc.), add to references
     if (selectedReferences.some(r => r.type === ref.type && r.id === ref.id && r.timestamp === ref.timestamp)) {
       return;
     }
     setSelectedReferences(prev => [...prev, ref]);
-    setShowReferencePicker(false);
   };
 
-  // Remove a reference
+  // Remove a reference (and its corresponding attachment if any)
   const removeReference = (index: number) => {
+    const refToRemove = selectedReferences[index];
     setSelectedReferences(prev => prev.filter((_, i) => i !== index));
+
+    // Also remove from attachedAssets if this was an attached asset
+    if (refToRemove?.type === 'clip') {
+      setAttachedAssets(prev => prev.filter(a => a.id !== refToRemove.id));
+    }
   };
 
   // Handle file attachment for animations
@@ -498,6 +549,9 @@ export default function AIPromptPanel({
     { icon: Scissors, text: 'Cut at chapters' },
     { icon: Sparkles, text: 'Create demo animation' },
     { icon: Zap, text: 'Animate transcript' },
+    { icon: Film, text: 'Add 5 animations' },
+    { icon: Move, text: 'Add Ken Burns zoom effect' },
+    { icon: Music, text: 'Extract audio to A1' },
   ];
 
   // Check if prompt is asking for a contextual animation (intro/outro that needs video context)
@@ -546,6 +600,103 @@ export default function AIPromptPanel({
     }
 
     return { isMatch: false, type: 'intro' };
+  };
+
+  // Parse duration from user prompt (e.g., "5 second", "10s", "15 seconds", "1 minute", "30sec")
+  const parseDurationFromPrompt = (text: string): number | undefined => {
+    const lower = text.toLowerCase();
+
+    // Match patterns like "5 second", "10s", "15 seconds", "5sec", "5-second"
+    const secondsMatch = lower.match(/(\d+(?:\.\d+)?)\s*[-]?\s*(?:second|sec|s\b)/);
+    if (secondsMatch) {
+      const seconds = parseFloat(secondsMatch[1]);
+      if (seconds >= 1 && seconds <= 120) { // Reasonable bounds: 1s to 2min
+        return seconds;
+      }
+    }
+
+    // Match patterns like "1 minute", "2min", "1.5 minutes"
+    const minutesMatch = lower.match(/(\d+(?:\.\d+)?)\s*[-]?\s*(?:minute|min|m\b)/);
+    if (minutesMatch) {
+      const minutes = parseFloat(minutesMatch[1]);
+      const seconds = minutes * 60;
+      if (seconds >= 1 && seconds <= 120) {
+        return seconds;
+      }
+    }
+
+    // Match "long" or "short" keywords for rough duration hints
+    if (lower.includes('long animation') || lower.includes('longer')) {
+      return 15; // Default "long" = 15 seconds
+    }
+    if (lower.includes('short animation') || lower.includes('quick') || lower.includes('brief')) {
+      return 5; // Default "short" = 5 seconds
+    }
+
+    return undefined; // Let the AI decide
+  };
+
+  // Parse time range from user prompt (e.g., "0:10-0:15", "at 1:30", "from 0:00 to 0:05", "10s-20s")
+  const parseTimeRangeFromPrompt = (text: string): { start: number; end: number } | undefined => {
+    // Match "M:SS-M:SS" or "M:SS to M:SS" patterns (e.g., "0:10-0:15", "1:00 to 1:30")
+    const rangeMatch = text.match(/(\d{1,2}):(\d{2})\s*[-–to]+\s*(\d{1,2}):(\d{2})/i);
+    if (rangeMatch) {
+      const startMins = parseInt(rangeMatch[1], 10);
+      const startSecs = parseInt(rangeMatch[2], 10);
+      const endMins = parseInt(rangeMatch[3], 10);
+      const endSecs = parseInt(rangeMatch[4], 10);
+
+      if (startSecs < 60 && endSecs < 60) {
+        const start = startMins * 60 + startSecs;
+        const end = endMins * 60 + endSecs;
+        if (end > start) {
+          return { start, end };
+        }
+      }
+    }
+
+    // Match "Xs-Ys" or "X seconds to Y seconds" patterns (e.g., "10s-20s", "10 seconds to 20 seconds")
+    const secsRangeMatch = text.match(/(\d+)\s*(?:s|sec|seconds?)\s*[-–to]+\s*(\d+)\s*(?:s|sec|seconds?)/i);
+    if (secsRangeMatch) {
+      const start = parseInt(secsRangeMatch[1], 10);
+      const end = parseInt(secsRangeMatch[2], 10);
+      if (end > start && start >= 0 && end <= 3600) {
+        return { start, end };
+      }
+    }
+
+    // Match "at M:SS" or "@ M:SS" patterns for single timestamp (create 5s window around it)
+    const atMatch = text.match(/(?:at|@)\s*(\d{1,2}):(\d{2})/i);
+    if (atMatch) {
+      const mins = parseInt(atMatch[1], 10);
+      const secs = parseInt(atMatch[2], 10);
+      if (secs < 60) {
+        const time = mins * 60 + secs;
+        return { start: Math.max(0, time - 2), end: time + 5 }; // 2s before to 5s after
+      }
+    }
+
+    // Match "at Xs" or "@ Xs" patterns (e.g., "at 30s", "@ 45 seconds")
+    const atSecsMatch = text.match(/(?:at|@)\s*(\d+)\s*(?:s|sec|seconds?)/i);
+    if (atSecsMatch) {
+      const time = parseInt(atSecsMatch[1], 10);
+      if (time >= 0 && time <= 3600) {
+        return { start: Math.max(0, time - 2), end: time + 5 };
+      }
+    }
+
+    // Match "from M:SS" without explicit end (use 10s duration)
+    const fromMatch = text.match(/from\s*(\d{1,2}):(\d{2})/i);
+    if (fromMatch && !text.match(/from\s*\d{1,2}:\d{2}\s*to/i)) {
+      const mins = parseInt(fromMatch[1], 10);
+      const secs = parseInt(fromMatch[2], 10);
+      if (secs < 60) {
+        const start = mins * 60 + secs;
+        return { start, end: start + 10 };
+      }
+    }
+
+    return undefined;
   };
 
   // Handle contextual animation workflow (analyzes first, shows concept for approval)
@@ -729,6 +880,7 @@ export default function AIPromptPanel({
   type WorkflowType =
     | 'edit-animation'      // Modify an existing Remotion animation
     | 'create-animation'    // Create a new Remotion animation
+    | 'batch-animations'    // Generate multiple animations across the video
     | 'motion-graphics'     // Add template-based motion graphics
     | 'captions'            // Add captions to video
     | 'auto-gif'            // Extract keywords and add GIFs
@@ -737,6 +889,7 @@ export default function AIPromptPanel({
     | 'chapter-cuts'        // Split video into chapters
     | 'transcript-animation' // Kinetic typography from speech
     | 'contextual-animation' // Animation based on video content
+    | 'extract-audio'       // Extract audio to separate track
     | 'ffmpeg-edit'         // Direct FFmpeg video manipulation
     | 'unknown';            // Need to ask for clarification
 
@@ -791,9 +944,20 @@ export default function AIPromptPanel({
       // If not explicitly about main video and not a video-only feature, edit the animation
       if (!isAboutMainVideo && !isVideoOnlyFeature) {
         // This includes: "make it bigger", "change colors", "add more scenes",
-        // "make it faster", "add an image", etc.
+        // "make it faster", "add an image", camera movements, etc.
         return 'edit-animation';
       }
+    }
+
+    // Camera movement requests (should route to animation workflows)
+    const isCameraMovement = lower.includes('zoom') || lower.includes('pan') ||
+                             lower.includes('ken burns') || lower.includes('camera') ||
+                             lower.includes('shake') || lower.includes('dolly') ||
+                             lower.includes('tracking shot') || lower.includes('tilt');
+
+    // If asking for camera movement on an existing animation, edit it
+    if (isCameraMovement && (ctx.editTabHasAnimation || ctx.selectedClipIsAiAnimation)) {
+      return 'edit-animation';
     }
 
     // ============================================
@@ -812,6 +976,15 @@ export default function AIPromptPanel({
       return 'dead-air';
     }
 
+    // Extract audio from video
+    if ((lower.includes('extract') && lower.includes('audio')) ||
+        (lower.includes('separate') && lower.includes('audio')) ||
+        (lower.includes('split') && lower.includes('audio')) ||
+        (lower.includes('remove') && lower.includes('audio') && lower.includes('track')) ||
+        (lower.includes('audio') && lower.includes('to') && (lower.includes('a1') || lower.includes('track')))) {
+      return 'extract-audio';
+    }
+
     // Chapter cuts
     if (lower.includes('chapter') || lower.includes('split into sections') ||
         lower.includes('segment') || (lower.includes('cut') && lower.includes('topic'))) {
@@ -824,7 +997,13 @@ export default function AIPromptPanel({
       return 'auto-gif';
     }
 
-    // B-roll requests
+    // B-roll with Remotion -> treat as batch animations
+    if ((lower.includes('b-roll') || lower.includes('broll')) &&
+        (lower.includes('remotion') || lower.includes('animation'))) {
+      return 'batch-animations';
+    }
+
+    // B-roll requests (static images)
     if (lower.includes('b-roll') || lower.includes('broll') ||
         lower.includes('stock image') || lower.includes('overlay image')) {
       return 'b-roll';
@@ -851,9 +1030,23 @@ export default function AIPromptPanel({
       return 'contextual-animation';
     }
 
+    // Batch animations (multiple animations across the video)
+    // Patterns: "add 5 animations", "create 3 animations", "generate animations throughout"
+    const batchAnimationMatch = lower.match(/(?:add|create|generate|make)\s+(\d+)\s+animation/i) ||
+                                lower.match(/(\d+)\s+animation/i);
+    if (batchAnimationMatch ||
+        (lower.includes('animations') && (lower.includes('throughout') || lower.includes('across') || lower.includes('multiple')))) {
+      return 'batch-animations';
+    }
+
     // Create new animation (explicit creation requests)
     if ((lower.includes('create') || lower.includes('make') || lower.includes('generate')) &&
         (lower.includes('animation') || lower.includes('animated') || lower.includes('motion'))) {
+      return 'create-animation';
+    }
+
+    // Camera movement requests without existing animation -> create new animation
+    if (isCameraMovement && (lower.includes('animation') || lower.includes('effect') || lower.includes('add'))) {
       return 'create-animation';
     }
 
@@ -1233,8 +1426,11 @@ export default function AIPromptPanel({
 
   // Handle custom AI-generated animation workflow
   const handleCustomAnimationWorkflow = async (description: string, startTimeOverride?: number, endTimeOverride?: number) => {
+    // Parse duration from the description if user specified one
+    const requestedDuration = parseDurationFromPrompt(description);
+
     // Debug: log what time values we received
-    console.log('[DEBUG] handleCustomAnimationWorkflow called with:', JSON.stringify({ description: description.substring(0, 50), startTimeOverride, endTimeOverride }));
+    console.log('[DEBUG] handleCustomAnimationWorkflow called with:', JSON.stringify({ description: description.substring(0, 50), startTimeOverride, endTimeOverride, requestedDuration }));
 
     // When a time range is specified, use the contextual workflow with approval step
     // This analyzes the video content and shows scenes for user review before rendering
@@ -1314,13 +1510,16 @@ export default function AIPromptPanel({
       const hasTimeRange = startTimeOverride !== undefined;
       const hasAttachments = currentAttachments.length > 0;
 
-      let statusMessage = `🎬 Creating custom animation...\n\n`;
+      let statusMessage = `🎬 Creating custom animation${requestedDuration ? ` (${requestedDuration}s)` : ''}...\n\n`;
       statusMessage += `1. ${hasTimeRange ? 'Using specified time range for context' : 'Analyzing video transcript for context'}\n`;
+      if (requestedDuration) {
+        statusMessage += `2. Target duration: ${requestedDuration} seconds\n`;
+      }
       if (hasAttachments) {
-        statusMessage += `2. Including ${currentAttachments.length} attached asset(s): ${currentAttachments.map(a => a.filename).join(', ')}\n`;
-        statusMessage += `3. Generating Remotion component with AI\n4. Rendering animation to video\n5. Adding to timeline`;
+        statusMessage += `${requestedDuration ? '3' : '2'}. Including ${currentAttachments.length} attached asset(s): ${currentAttachments.map(a => a.filename).join(', ')}\n`;
+        statusMessage += `${requestedDuration ? '4' : '3'}. Generating Remotion component with AI\n${requestedDuration ? '5' : '4'}. Rendering animation to video\n${requestedDuration ? '6' : '5'}. Adding to timeline`;
       } else {
-        statusMessage += `2. Generating Remotion component with AI\n3. Rendering animation to video\n4. Adding to timeline`;
+        statusMessage += `${requestedDuration ? '3' : '2'}. Generating Remotion component with AI\n${requestedDuration ? '4' : '3'}. Rendering animation to video\n${requestedDuration ? '5' : '4'}. Adding to timeline`;
       }
       statusMessage += `\n\nThis may take a moment...`;
 
@@ -1330,8 +1529,8 @@ export default function AIPromptPanel({
         isProcessingGifs: true,
       }]);
 
-      // Pass time range and attached assets to the animation generator
-      const result = await onCreateCustomAnimation(description, startTimeOverride, endTimeOverride, attachedAssetIds.length > 0 ? attachedAssetIds : undefined);
+      // Pass time range, attached assets, and duration to the animation generator
+      const result = await onCreateCustomAnimation(description, startTimeOverride, endTimeOverride, attachedAssetIds.length > 0 ? attachedAssetIds : undefined, requestedDuration);
 
       // Clear attachments after successful creation
       clearAttachments();
@@ -1637,6 +1836,97 @@ export default function AIPromptPanel({
     }
   };
 
+  // Handle batch animation generation (multiple animations across the video)
+  const handleBatchAnimationsWorkflow = async (count: number) => {
+    if (!onGenerateBatchAnimations) return;
+
+    setIsProcessing(true);
+    setProcessingStatus('Planning animations...');
+
+    try {
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `🎬 Generating ${count} animations across your video...\n\n1. Transcribing video to understand content\n2. Planning strategic animation placements\n3. Generating ${count} unique animations\n4. Adding to timeline at optimal positions\n\nThis may take a while (generating ${count} animations)...`,
+        isProcessingGifs: true,
+      }]);
+
+      const result = await onGenerateBatchAnimations(count);
+
+      // Build summary of generated animations
+      const animationList = result.animations
+        .map((a, i) => `${i + 1}. ${a.type} at ${formatTimeShort(a.startTime)}: "${a.title}" (${a.duration.toFixed(1)}s)`)
+        .join('\n');
+
+      // Update the last message to show completion
+      setChatHistory(prev => {
+        const updated = [...prev];
+        const lastIdx = updated.length - 1;
+        if (updated[lastIdx]?.isProcessingGifs) {
+          updated[lastIdx] = {
+            ...updated[lastIdx],
+            text: `✅ Generated ${result.animations.length} animations!\n\nAnimations added to your timeline:\n${animationList}\n\nVideo duration: ${result.videoDuration.toFixed(1)}s\n\nYou can edit individual animations by selecting them on the timeline.`,
+            isProcessingGifs: false,
+            applied: true,
+          };
+        }
+        return updated;
+      });
+
+    } catch (error) {
+      console.error('Batch animations error:', error);
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `❌ Failed to generate animations: ${error instanceof Error ? error.message : 'Unknown error'}\n\nMake sure you have a video uploaded and the FFmpeg server is running.`,
+      }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
+  // Handle extract audio workflow (separates audio to A1 track, mutes video)
+  const handleExtractAudioWorkflow = async () => {
+    if (!onExtractAudio) return;
+
+    setIsProcessing(true);
+    setProcessingStatus('Extracting audio...');
+
+    try {
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: '🎵 Extracting audio from your video...\n\n1. Extracting audio track to separate file\n2. Creating muted version of video\n3. Adding audio to A1 track\n4. Replacing video with muted version\n\nThis will give you independent control over video and audio.',
+        isProcessingGifs: true,
+      }]);
+
+      const result = await onExtractAudio();
+
+      // Update the last message to show completion
+      setChatHistory(prev => {
+        const updated = [...prev];
+        const lastIdx = updated.length - 1;
+        if (updated[lastIdx]?.isProcessingGifs) {
+          updated[lastIdx] = {
+            ...updated[lastIdx],
+            text: `✅ Audio extracted successfully!\n\n🎵 Audio: "${result.audioAsset.filename}" (${result.audioAsset.duration.toFixed(1)}s) → Added to A1 track\n🎬 Video: "${result.mutedVideoAsset.filename}" → Replaced original (now muted)\n\nYou can now edit video and audio independently!`,
+            isProcessingGifs: false,
+            applied: true,
+          };
+        }
+        return updated;
+      });
+
+    } catch (error) {
+      console.error('Extract audio error:', error);
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `❌ Failed to extract audio: ${error instanceof Error ? error.message : 'Unknown error'}\n\nMake sure you have a video uploaded and the FFmpeg server is running.`,
+      }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!prompt.trim()) return;
@@ -1644,7 +1934,12 @@ export default function AIPromptPanel({
     const referenceContext = buildReferenceContext();
     const userMessage = prompt.trim();
     const fullMessage = referenceContext + userMessage;
-    const savedTimeRange = timeRange; // Save for display before clearing
+
+    // Check for time range: first use UI selection, then try to parse from prompt text
+    const uiTimeRange = timeRange;
+    const promptTimeRange = !uiTimeRange ? parseTimeRangeFromPrompt(userMessage) : undefined;
+    const savedTimeRange = uiTimeRange || promptTimeRange; // Use UI selection first, then parsed from prompt
+
     setPrompt('');
     setSelectedReferences([]); // Clear references after submit
     clearTimeRange(); // Clear time range after submit
@@ -1819,6 +2114,19 @@ export default function AIPromptPanel({
       return;
     }
 
+    // Extract audio from video
+    if (workflow === 'extract-audio') {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: 'Please upload a video first. I\'ll then extract the audio to a separate track.',
+        }]);
+        return;
+      }
+      await handleExtractAudioWorkflow();
+      return;
+    }
+
     // Transcript animation (kinetic typography)
     if (workflow === 'transcript-animation') {
       if (!hasVideo) {
@@ -1829,6 +2137,22 @@ export default function AIPromptPanel({
         return;
       }
       await handleTranscriptAnimationWorkflow();
+      return;
+    }
+
+    // Batch animations (multiple animations across the video)
+    if (workflow === 'batch-animations') {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: 'Please upload a video first. I\'ll then analyze it and generate multiple animations.',
+        }]);
+        return;
+      }
+      // Extract count from prompt (e.g., "add 5 animations" -> 5)
+      const countMatch = userMessage.toLowerCase().match(/(\d+)\s*animation/);
+      const count = countMatch ? parseInt(countMatch[1], 10) : 5; // Default to 5 if no number specified
+      await handleBatchAnimationsWorkflow(count);
       return;
     }
 
@@ -2433,7 +2757,7 @@ export default function AIPromptPanel({
                               <div className="w-12 h-12 rounded-lg overflow-hidden bg-zinc-700 flex-shrink-0 flex items-center justify-center">
                                 {asset.thumbnailUrl ? (
                                   <img
-                                    src={`http://localhost:3333${asset.thumbnailUrl}`}
+                                    src={asset.thumbnailUrl}
                                     alt=""
                                     className="w-full h-full object-cover"
                                     onError={(e) => {

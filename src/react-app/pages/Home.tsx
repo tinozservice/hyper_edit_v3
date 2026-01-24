@@ -6,12 +6,14 @@ import ClipPropertiesPanel from '@/react-app/components/ClipPropertiesPanel';
 import CaptionPropertiesPanel from '@/react-app/components/CaptionPropertiesPanel';
 import AIPromptPanel from '@/react-app/components/AIPromptPanel';
 import PicassoPanel from '@/react-app/components/PicassoPanel';
+import DiCaprioPanel from '@/react-app/components/DiCaprioPanel';
+import GifSearchPanel from '@/react-app/components/GifSearchPanel';
 import ResizablePanel from '@/react-app/components/ResizablePanel';
 import ResizableVerticalPanel from '@/react-app/components/ResizableVerticalPanel';
 import TimelineTabs from '@/react-app/components/TimelineTabs';
 import { useProject, Asset, TimelineClip, CaptionStyle } from '@/react-app/hooks/useProject';
 import { useVideoSession } from '@/react-app/hooks/useVideoSession';
-import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Palette } from 'lucide-react';
+import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Palette, Film } from 'lucide-react';
 import type { TemplateId } from '@/remotion/templates';
 
 interface ChapterData {
@@ -31,7 +33,8 @@ export default function Home() {
   const [previewAssetId, setPreviewAssetId] = useState<string | null>(null);
   const [aspectRatio, setAspectRatio] = useState<'16:9' | '9:16'>('16:9');
   const [autoSnap, setAutoSnap] = useState(true); // Ripple delete mode - shift clips when deleting
-  const [activeAgent, setActiveAgent] = useState<'director' | 'picasso'>('director');
+  const [activeAgent, setActiveAgent] = useState<'director' | 'picasso' | 'dicaprio'>('director');
+  const [showGifSearch, setShowGifSearch] = useState(false);
 
   const videoPreviewRef = useRef<VideoPreviewHandle>(null);
   const playbackRef = useRef<number | null>(null);
@@ -168,6 +171,33 @@ export default function Home() {
       }
     }
 
+    // Check audio tracks (A1, A2)
+    const audioTracks = ['A1', 'A2'];
+
+    for (const trackId of audioTracks) {
+      const clipsOnTrack = activeClips.filter(c =>
+        c.trackId === trackId &&
+        currentTime >= c.start &&
+        currentTime < c.start + c.duration
+      );
+
+      for (const clip of clipsOnTrack) {
+        const asset = assets.find(a => a.id === clip.assetId);
+        const url = asset?.streamUrl || (asset ? getAssetStreamUrl(asset.id) : null);
+        if (asset && url && asset.type === 'audio') {
+          const clipTime = (currentTime - clip.start) + (clip.inPoint || 0);
+          layers.push({
+            id: clip.id,
+            url,
+            type: 'audio',
+            trackId: clip.trackId,
+            clipTime,
+            clipStart: clip.start,
+          });
+        }
+      }
+    }
+
     // Check caption track (T1)
     const captionClips = activeClips.filter(c =>
       c.trackId === 'T1' &&
@@ -178,13 +208,13 @@ export default function Home() {
     for (const clip of captionClips) {
       const caption = getCaptionData(clip.id);
       if (caption) {
-        const clipTime = currentTime - clip.start;
+        // Words have relative timestamps (0 to chunk duration), so pass clip-relative time
         layers.push({
           id: clip.id,
           url: '',
           type: 'caption',
           trackId: clip.trackId,
-          clipTime,
+          clipTime: currentTime - clip.start, // Convert to clip-relative time
           clipStart: clip.start,
           captionWords: caption.words,
           captionStyle: caption.style,
@@ -275,6 +305,13 @@ export default function Home() {
       }
     }
   }, [uploadAsset]);
+
+  // Handle GIF added from search panel
+  const handleGifAdded = useCallback(async () => {
+    // Refresh assets to include the newly added GIF
+    await refreshAssets();
+    setShowGifSearch(false);
+  }, [refreshAssets]);
 
   // Handle drag start from asset library
   const handleAssetDragStart = useCallback((_asset: Asset) => {
@@ -455,15 +492,7 @@ export default function Home() {
     setSelectedClipId(clipId);
     // Clear asset preview mode - let timeline-based preview take over
     setPreviewAssetId(null);
-
-    // If a clip is selected, move playhead to clip start
-    if (clipId) {
-      const clip = clips.find(c => c.id === clipId);
-      if (clip) {
-        setCurrentTime(clip.start);
-      }
-    }
-  }, [clips]);
+  }, []);
 
   // Handle updating clip transform (scale, rotation, crop, etc.)
   const handleUpdateClipTransform = useCallback((clipId: string, transform: TimelineClip['transform']) => {
@@ -780,7 +809,7 @@ export default function Home() {
 
     if (!data.brollAssets || data.brollAssets.length === 0) {
       console.warn('No B-roll assets returned from server');
-      return data;
+      throw new Error('No B-roll images were generated. The AI image generation may have failed - check the server logs for details.');
     }
 
     // Refresh assets from server to get the newly generated B-roll images
@@ -1050,7 +1079,7 @@ export default function Home() {
   }, [session, currentTime, addClip, saveProject, refreshAssets, switchTimelineTab]);
 
   // Handle custom AI-generated animation creation
-  const handleCreateCustomAnimation = useCallback(async (description: string, startTime?: number, endTime?: number, attachedAssetIds?: string[]) => {
+  const handleCreateCustomAnimation = useCallback(async (description: string, startTime?: number, endTime?: number, attachedAssetIds?: string[], durationSeconds?: number) => {
     if (!session?.sessionId) {
       throw new Error('Please upload a video first to start a session');
     }
@@ -1075,7 +1104,7 @@ export default function Home() {
         }
       }
 
-      console.log(`[Animation] Creating with video context: ${videoAssetId || 'none'}, time range: ${startTime !== undefined ? `${startTime}s` : 'auto'}${endTime !== undefined ? ` - ${endTime}s` : ''}${attachedAssetIds?.length ? `, attached assets: ${attachedAssetIds.length}` : ''}`);
+      console.log(`[Animation] Creating with video context: ${videoAssetId || 'none'}, time range: ${startTime !== undefined ? `${startTime}s` : 'auto'}${endTime !== undefined ? ` - ${endTime}s` : ''}${attachedAssetIds?.length ? `, attached assets: ${attachedAssetIds.length}` : ''}${durationSeconds ? `, duration: ${durationSeconds}s` : ''}`);
 
       // Call the server to generate AI animation with video context
       const response = await fetch(`http://localhost:3333/session/${session.sessionId}/generate-animation`, {
@@ -1087,6 +1116,7 @@ export default function Home() {
           startTime,    // Optional: specific time range
           endTime,      // Optional: specific time range
           attachedAssetIds, // Optional: images/videos to include in animation
+          durationSeconds, // Optional: user-specified duration
           fps: 30,
           width: 1920,
           height: 1080,
@@ -1303,6 +1333,100 @@ export default function Home() {
       duration: data.duration,
     };
   }, [session, currentTime, refreshAssets, addClip, saveProject]);
+
+  // Handle batch animation generation (multiple animations across the video)
+  const handleGenerateBatchAnimations = useCallback(async (count: number) => {
+    if (!session?.sessionId) {
+      throw new Error('Please upload a video first to start a session');
+    }
+
+    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/generate-batch-animations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        count,
+        fps: 30,
+        width: 1920,
+        height: 1080,
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to generate batch animations');
+    }
+
+    const data = await response.json();
+
+    // Refresh assets to get the newly generated animations
+    await refreshAssets();
+
+    // Add each animation to the timeline at its planned position
+    for (const animation of data.animations) {
+      addClip(animation.assetId, 'V2', animation.startTime, animation.duration);
+    }
+
+    await saveProject();
+
+    console.log('Batch animations generated:', data);
+
+    return {
+      animations: data.animations,
+      videoDuration: data.videoDuration,
+    };
+  }, [session, refreshAssets, addClip, saveProject]);
+
+  // Handle extract audio (separates audio to A1 track, replaces video with muted version)
+  const handleExtractAudio = useCallback(async () => {
+    if (!session?.sessionId) {
+      throw new Error('Please upload a video first to start a session');
+    }
+
+    // Find the main video asset (non-AI generated, on V1)
+    const v1Clip = clips.find(c => c.trackId === 'V1');
+    if (!v1Clip) {
+      throw new Error('No video clip found on V1 track');
+    }
+
+    const videoAsset = assets.find(a => a.id === v1Clip.assetId && a.type === 'video');
+    if (!videoAsset) {
+      throw new Error('No video asset found');
+    }
+
+    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/extract-audio`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        assetId: videoAsset.id,
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to extract audio');
+    }
+
+    const data = await response.json();
+
+    // Refresh assets to get the new audio and muted video assets
+    await refreshAssets();
+
+    // Update V1 clip to use the muted video
+    updateClip(v1Clip.id, { assetId: data.mutedVideoAsset.id });
+
+    // Add the audio to A1 track at the same position as the video
+    addClip(data.audioAsset.id, 'A1', v1Clip.start, data.audioAsset.duration);
+
+    await saveProject();
+
+    console.log('Audio extracted:', data);
+
+    return {
+      audioAsset: data.audioAsset,
+      mutedVideoAsset: data.mutedVideoAsset,
+      originalAssetId: data.originalAssetId,
+    };
+  }, [session, clips, assets, refreshAssets, updateClip, addClip, saveProject]);
 
   // Handle contextual animation creation (uses video content to inform the animation)
   const handleCreateContextualAnimation = useCallback(async (request: {
@@ -1652,6 +1776,7 @@ export default function Home() {
                 onSelect={handleAssetSelect}
                 selectedAssetId={selectedAssetId}
                 uploading={loading}
+                onOpenGifSearch={() => setShowGifSearch(true)}
               />
             </div>
 
@@ -1753,28 +1878,39 @@ export default function Home() {
         >
           <div className="h-full flex flex-col bg-zinc-900/80 backdrop-blur-sm">
             {/* Agent Tabs */}
-            <div className="flex border-b border-zinc-800/50">
+            <div className="flex items-center gap-1 px-2 border-b border-zinc-800/50">
               <button
                 onClick={() => setActiveAgent('director')}
-                className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium transition-colors ${
+                className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors ${
                   activeAgent === 'director'
-                    ? 'text-purple-400 border-b-2 border-purple-400 bg-zinc-800/30'
+                    ? 'text-orange-500 border-b-2 border-orange-500 bg-zinc-800/30'
                     : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
                 }`}
               >
-                <Sparkles className="w-4 h-4" />
+                <Sparkles className="w-3.5 h-3.5" />
                 Director
               </button>
               <button
                 onClick={() => setActiveAgent('picasso')}
-                className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium transition-colors ${
+                className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors ${
                   activeAgent === 'picasso'
-                    ? 'text-pink-400 border-b-2 border-pink-400 bg-zinc-800/30'
+                    ? 'text-orange-300 border-b-2 border-orange-300 bg-zinc-800/30'
                     : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
                 }`}
               >
-                <Palette className="w-4 h-4" />
+                <Palette className="w-3.5 h-3.5" />
                 Picasso
+              </button>
+              <button
+                onClick={() => setActiveAgent('dicaprio')}
+                className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors ${
+                  activeAgent === 'dicaprio'
+                    ? 'text-zinc-300 border-b-2 border-zinc-300 bg-zinc-800/30'
+                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
+                }`}
+              >
+                <Film className="w-3.5 h-3.5" />
+                DiCaprio
               </button>
             </div>
 
@@ -1794,6 +1930,8 @@ export default function Home() {
                   onAnalyzeForAnimation={handleAnalyzeForAnimation}
                   onRenderFromConcept={handleRenderFromConcept}
                   onGenerateTranscriptAnimation={handleGenerateTranscriptAnimation}
+                  onGenerateBatchAnimations={handleGenerateBatchAnimations}
+                  onExtractAudio={handleExtractAudio}
                   onCreateContextualAnimation={handleCreateContextualAnimation}
                   onOpenAnimationInTab={handleOpenAnimationInTab}
                   onEditAnimation={handleEditAnimation}
@@ -1820,10 +1958,29 @@ export default function Home() {
                   onRefreshAssets={refreshAssets}
                 />
               </div>
+              <div className={`absolute inset-0 ${activeAgent === 'dicaprio' ? '' : 'hidden'}`}>
+                <DiCaprioPanel
+                  sessionId={session?.sessionId ?? null}
+                  assets={assets}
+                  onVideoGenerated={(assetId) => {
+                    console.log('Video generated:', assetId);
+                  }}
+                  onRefreshAssets={refreshAssets}
+                />
+              </div>
             </div>
           </div>
         </ResizablePanel>
       </div>
+
+      {/* GIF Search Modal */}
+      {showGifSearch && session?.sessionId && (
+        <GifSearchPanel
+          sessionId={session.sessionId}
+          onClose={() => setShowGifSearch(false)}
+          onGifAdded={handleGifAdded}
+        />
+      )}
     </div>
   );
 }

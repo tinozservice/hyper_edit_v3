@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Palette, Send, Loader2, ImageIcon, Sparkles, X } from 'lucide-react';
+import { Palette, Send, Loader2, Sparkles, X, Zap, Image, Square, RectangleVertical } from 'lucide-react';
 
 interface ChatMessage {
   type: 'user' | 'assistant';
@@ -24,13 +24,11 @@ interface PicassoPanelProps {
   onRefreshAssets?: () => void;
 }
 
-const ASPECT_RATIOS = [
-  { value: '16:9', label: '16:9 (Landscape)' },
-  { value: '9:16', label: '9:16 (Portrait)' },
-  { value: '1:1', label: '1:1 (Square)' },
-  { value: '4:3', label: '4:3' },
-  { value: '3:2', label: '3:2' },
-  { value: '21:9', label: '21:9 (Ultrawide)' },
+const QUICK_ACTIONS = [
+  { icon: Image, text: 'Generate a landscape background' },
+  { icon: Square, text: 'Create a square thumbnail' },
+  { icon: RectangleVertical, text: 'Design a vertical poster' },
+  { icon: Sparkles, text: 'Create an abstract pattern' },
 ];
 
 export default function PicassoPanel({
@@ -39,22 +37,30 @@ export default function PicassoPanel({
   onRefreshAssets,
 }: PicassoPanelProps) {
   const [prompt, setPrompt] = useState('');
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      type: 'assistant',
-      text: "Hi! I'm Picasso, your creative image generation assistant. Just describe what you want — even a simple idea like 'a cat on a windowsill' — and I'll enhance your prompt with professional lighting, composition, and style details to create stunning visuals. Try me!",
-    },
-  ]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [aspectRatio, setAspectRatio] = useState('16:9');
-  const [showSettings, setShowSettings] = useState(false);
+  const [aspectRatio] = useState('16:9');
+  const [showQuickActions, setShowQuickActions] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const quickActionsRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // Close quick actions when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (quickActionsRef.current && !quickActionsRef.current.contains(e.target as Node)) {
+        setShowQuickActions(false);
+      }
+    };
+    if (showQuickActions) {
+      document.addEventListener('mousedown', handleClickOutside);
+      return () => document.removeEventListener('mousedown', handleClickOutside);
+    }
+  }, [showQuickActions]);
 
   // Check if prompt contains dimension/orientation keywords
   const hasDimensionKeywords = (text: string): boolean => {
@@ -147,7 +153,8 @@ export default function PicassoPanel({
     generateImage(lastAwaitingMessage.pendingPrompt, ratio);
   };
 
-  const handleSubmit = async () => {
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
     if (!prompt.trim() || isGenerating || !sessionId) return;
 
     const userMessage = prompt.trim();
@@ -186,186 +193,202 @@ export default function PicassoPanel({
     await generateImage(userMessage, detectedRatio);
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSubmit();
-    }
-  };
-
   return (
     <div className="flex flex-col h-full bg-zinc-900/80">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800/50">
-        <div className="flex items-center gap-2">
-          <div className="p-1.5 bg-gradient-to-br from-pink-500 to-purple-600 rounded-lg">
-            <Palette className="w-4 h-4 text-white" />
+      <div className="p-4 border-b border-zinc-800/50">
+        <div className="flex items-center gap-2 mb-2">
+          <div className="w-8 h-8 bg-gradient-to-br from-orange-400 to-amber-300 rounded-lg flex items-center justify-center">
+            <Palette className="w-4 h-4" />
           </div>
-          <div>
-            <h3 className="text-sm font-medium text-zinc-100">Picasso</h3>
-            <p className="text-xs text-zinc-500">Image Generation</p>
-          </div>
+          <h2 className="font-semibold">Picasso</h2>
         </div>
-        <button
-          onClick={() => setShowSettings(!showSettings)}
-          className={`p-1.5 rounded-lg transition-colors ${
-            showSettings ? 'bg-zinc-700 text-zinc-100' : 'text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800'
-          }`}
-        >
-          <Sparkles className="w-4 h-4" />
-        </button>
+        <p className="text-xs text-zinc-400">
+          Describe the image you want to create
+        </p>
       </div>
 
-      {/* Settings Panel */}
-      {showSettings && (
-        <div className="px-4 py-3 border-b border-zinc-800/50 bg-zinc-800/30">
-          <div className="flex items-center justify-between mb-2">
-            <label className="text-xs font-medium text-zinc-400">Aspect Ratio</label>
-            <button
-              onClick={() => setShowSettings(false)}
-              className="text-zinc-500 hover:text-zinc-300"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
+      {/* Processing overlay */}
+      {isGenerating && (
+        <div className="p-4 bg-orange-400/10 border-b border-orange-400/20">
+          <div className="flex items-center gap-3">
+            <Loader2 className="w-5 h-5 text-orange-300 animate-spin" />
+            <div className="flex-1">
+              <p className="text-sm text-orange-200 font-medium">
+                Generating image...
+              </p>
+            </div>
           </div>
-          <select
-            value={aspectRatio}
-            onChange={(e) => setAspectRatio(e.target.value)}
-            className="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-100 focus:outline-none focus:border-purple-500"
-          >
-            {ASPECT_RATIOS.map((ratio) => (
-              <option key={ratio.value} value={ratio.value}>
-                {ratio.label}
-              </option>
-            ))}
-          </select>
         </div>
       )}
 
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {messages.map((message, index) => (
-          <div
-            key={index}
-            className={`flex ${message.type === 'user' ? 'justify-end' : 'justify-start'}`}
-          >
-            <div
-              className={`max-w-[85%] rounded-2xl px-4 py-2 ${
-                message.type === 'user'
-                  ? 'bg-purple-600 text-white'
-                  : message.error
-                  ? 'bg-red-500/20 text-red-200 border border-red-500/30'
-                  : 'bg-zinc-800 text-zinc-100'
-              }`}
-            >
-              <p className="text-sm whitespace-pre-wrap">{message.text}</p>
-
-              {/* Dimension Selection Buttons */}
-              {message.awaitingDimension && (
-                <div className="flex gap-2 mt-3">
-                  <button
-                    onClick={() => handleDimensionSelect('horizontal')}
-                    disabled={isGenerating}
-                    className="flex-1 flex flex-col items-center gap-1 px-3 py-2 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 rounded-lg transition-colors"
-                  >
-                    <div className="w-8 h-5 border-2 border-purple-400 rounded" />
-                    <span className="text-xs text-zinc-300">Horizontal</span>
-                  </button>
-                  <button
-                    onClick={() => handleDimensionSelect('vertical')}
-                    disabled={isGenerating}
-                    className="flex-1 flex flex-col items-center gap-1 px-3 py-2 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 rounded-lg transition-colors"
-                  >
-                    <div className="w-5 h-8 border-2 border-purple-400 rounded" />
-                    <span className="text-xs text-zinc-300">Vertical</span>
-                  </button>
-                  <button
-                    onClick={() => handleDimensionSelect('square')}
-                    disabled={isGenerating}
-                    className="flex-1 flex flex-col items-center gap-1 px-3 py-2 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 rounded-lg transition-colors"
-                  >
-                    <div className="w-6 h-6 border-2 border-purple-400 rounded" />
-                    <span className="text-xs text-zinc-300">Square</span>
-                  </button>
+      {/* Chat history */}
+      <div className="flex-1 p-4 overflow-y-auto space-y-4">
+        {messages.length === 0 ? (
+          <div className="text-center text-sm text-zinc-500 py-8">
+            {sessionId
+              ? "No images yet. Use Quick Actions below to get started!"
+              : 'Upload a video first to start generating images'}
+          </div>
+        ) : (
+          messages.map((message, idx) => (
+            <div key={idx} className="space-y-2">
+              {message.type === 'user' ? (
+                <div className="flex justify-end">
+                  <div className="bg-gradient-to-r from-orange-400 to-amber-300 rounded-lg px-3 py-2 max-w-[85%]">
+                    <p className="text-sm text-white">{message.text}</p>
+                  </div>
                 </div>
-              )}
+              ) : (
+                <div className="space-y-2">
+                  <div className={`bg-zinc-800 rounded-lg p-3 space-y-2 ${message.error ? 'border border-red-500/30' : ''}`}>
+                    <p className={`text-sm whitespace-pre-wrap ${message.error ? 'text-red-200' : 'text-zinc-200'}`}>{message.text}</p>
 
-              {/* Generated Images */}
-              {message.images && message.images.length > 0 && (
-                <div className="mt-3 space-y-2">
-                  {message.images.map((image) => (
-                    <div
-                      key={image.id}
-                      className="relative rounded-lg overflow-hidden bg-zinc-900"
-                    >
-                      <img
-                        src={`http://localhost:3333${image.streamUrl}`}
-                        alt={image.filename}
-                        className="w-full h-auto"
-                        loading="lazy"
-                      />
-                      <div className="absolute bottom-0 left-0 right-0 px-2 py-1 bg-black/50 backdrop-blur-sm">
-                        <p className="text-xs text-zinc-300 truncate">{image.filename}</p>
-                        <p className="text-xs text-zinc-500">
-                          {image.width} x {image.height}
-                        </p>
+                    {/* Dimension Selection Buttons */}
+                    {message.awaitingDimension && (
+                      <div className="flex gap-2 mt-3">
+                        <button
+                          onClick={() => handleDimensionSelect('horizontal')}
+                          disabled={isGenerating}
+                          className="flex-1 flex flex-col items-center gap-1 px-3 py-2 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 rounded-lg transition-colors"
+                        >
+                          <div className="w-8 h-5 border-2 border-orange-300 rounded" />
+                          <span className="text-xs text-zinc-300">Horizontal</span>
+                        </button>
+                        <button
+                          onClick={() => handleDimensionSelect('vertical')}
+                          disabled={isGenerating}
+                          className="flex-1 flex flex-col items-center gap-1 px-3 py-2 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 rounded-lg transition-colors"
+                        >
+                          <div className="w-5 h-8 border-2 border-orange-300 rounded" />
+                          <span className="text-xs text-zinc-300">Vertical</span>
+                        </button>
+                        <button
+                          onClick={() => handleDimensionSelect('square')}
+                          disabled={isGenerating}
+                          className="flex-1 flex flex-col items-center gap-1 px-3 py-2 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 rounded-lg transition-colors"
+                        >
+                          <div className="w-6 h-6 border-2 border-orange-300 rounded" />
+                          <span className="text-xs text-zinc-300">Square</span>
+                        </button>
                       </div>
-                    </div>
-                  ))}
+                    )}
+
+                    {/* Generated Images */}
+                    {message.images && message.images.length > 0 && (
+                      <div className="mt-3 space-y-2">
+                        {message.images.map((image) => (
+                          <div
+                            key={image.id}
+                            className="relative rounded-lg overflow-hidden bg-zinc-900"
+                          >
+                            <img
+                              src={`http://localhost:3333${image.streamUrl}`}
+                              alt={image.filename}
+                              className="w-full h-auto"
+                              loading="lazy"
+                            />
+                            <div className="absolute bottom-0 left-0 right-0 px-2 py-1 bg-black/50 backdrop-blur-sm">
+                              <p className="text-xs text-zinc-300 truncate">{image.filename}</p>
+                              <p className="text-xs text-zinc-500">
+                                {image.width} x {image.height}
+                              </p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
-          </div>
-        ))}
-
-        {/* Loading indicator */}
-        {isGenerating && (
-          <div className="flex justify-start">
-            <div className="bg-zinc-800 text-zinc-100 rounded-2xl px-4 py-3">
-              <div className="flex items-center gap-2">
-                <Loader2 className="w-4 h-4 animate-spin text-purple-400" />
-                <span className="text-sm text-zinc-400">Generating image...</span>
-              </div>
-            </div>
-          </div>
+          ))
         )}
-
         <div ref={messagesEndRef} />
       </div>
 
       {/* Input */}
-      <div className="p-4 border-t border-zinc-800/50">
-        {!sessionId ? (
-          <div className="text-center text-zinc-500 text-sm py-2">
-            <ImageIcon className="w-5 h-5 mx-auto mb-1 opacity-50" />
-            Upload a video to start generating images
-          </div>
-        ) : (
-          <div className="relative">
-            <textarea
-              ref={inputRef}
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="Describe the image you want to create..."
-              className="w-full px-4 py-3 pr-12 bg-zinc-800 border border-zinc-700 rounded-xl text-sm text-zinc-100 placeholder-zinc-500 resize-none focus:outline-none focus:border-purple-500 transition-colors"
-              rows={2}
-              disabled={isGenerating}
-            />
+      <form onSubmit={handleSubmit} className="p-4 border-t border-zinc-800/50">
+        {/* Quick Actions Popover */}
+        <div className="relative mb-3" ref={quickActionsRef}>
+          <button
+            type="button"
+            onClick={() => setShowQuickActions(!showQuickActions)}
+            disabled={!sessionId || isGenerating}
+            className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+              showQuickActions
+                ? 'bg-orange-400/20 text-orange-300 ring-1 ring-orange-400/50'
+                : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300 disabled:opacity-50 disabled:cursor-not-allowed'
+            }`}
+          >
+            <Zap className="w-4 h-4" />
+            Quick Actions
+            {showQuickActions && <X className="w-3 h-3 ml-auto" />}
+          </button>
+
+          {/* Popover Menu */}
+          {showQuickActions && (
+            <div className="absolute bottom-full left-0 right-0 mb-2 p-2 bg-zinc-800 border border-zinc-700 rounded-xl shadow-xl z-10 animate-in fade-in slide-in-from-bottom-2 duration-200">
+              <div className="grid grid-cols-2 gap-1.5">
+                {QUICK_ACTIONS.map((action, idx) => (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => {
+                      setPrompt(action.text);
+                      setShowQuickActions(false);
+                    }}
+                    className="flex items-center gap-2 px-3 py-2.5 bg-zinc-700/50 hover:bg-zinc-700 rounded-lg text-xs text-left transition-colors group"
+                  >
+                    <action.icon className="w-4 h-4 text-zinc-400 group-hover:text-orange-300 transition-colors flex-shrink-0" />
+                    <span className="text-zinc-300 leading-tight">{action.text}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Unified Input Container */}
+        <div className="bg-zinc-800 rounded-xl border border-zinc-700/50 focus-within:ring-2 focus-within:ring-orange-400/50 transition-all">
+          {/* Textarea */}
+          <textarea
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder={sessionId ? "Describe your image..." : "Upload a video first..."}
+            className="w-full px-3 pt-3 pb-2 bg-transparent text-sm resize-none focus:outline-none placeholder:text-zinc-500"
+            rows={2}
+            disabled={isGenerating || !sessionId}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleSubmit(e);
+              }
+            }}
+          />
+
+          {/* Bottom Toolbar */}
+          <div className="flex items-center justify-between px-2 pb-2">
+            <div className="flex items-center gap-1">
+              <div className="w-px h-4 bg-zinc-700 mx-1" />
+              <span className="text-[10px] text-zinc-500">Enter to send</span>
+            </div>
+
+            {/* Send Button */}
             <button
-              onClick={handleSubmit}
-              disabled={!prompt.trim() || isGenerating}
-              className="absolute right-2 bottom-2 p-2 bg-purple-600 hover:bg-purple-500 disabled:bg-zinc-700 disabled:cursor-not-allowed rounded-lg transition-colors"
+              type="submit"
+              disabled={!prompt.trim() || isGenerating || !sessionId}
+              className="w-8 h-8 bg-gradient-to-r from-orange-400 to-amber-300 disabled:from-zinc-700 disabled:to-zinc-700 rounded-lg flex items-center justify-center transition-all hover:shadow-lg hover:shadow-orange-400/50 disabled:shadow-none"
             >
               {isGenerating ? (
-                <Loader2 className="w-4 h-4 text-white animate-spin" />
+                <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
               ) : (
-                <Send className="w-4 h-4 text-white" />
+                <Send className="w-4 h-4" />
               )}
             </button>
           </div>
-        )}
-      </div>
+        </div>
+      </form>
     </div>
   );
 }

@@ -159,20 +159,20 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
     });
   }, [isPlaying]);
 
-  // Sync overlay video seeking when scrubbing
+  // Sync overlay video and audio seeking when scrubbing
   useEffect(() => {
     if (isPlaying) return; // Don't interfere during playback
 
-    // Find overlay video layers and sync their time
-    const overlayVideoLayers = layers.filter(
-      l => l.type === 'video' && l.trackId !== 'V1'
+    // Find overlay video and audio layers and sync their time
+    const overlayMediaLayers = layers.filter(
+      l => (l.type === 'video' && l.trackId !== 'V1') || l.type === 'audio'
     );
 
-    overlayVideoLayers.forEach((layer) => {
-      const video = overlayVideoRefs.current.get(layer.id);
-      if (video && layer.clipTime !== undefined) {
-        if (Math.abs(video.currentTime - layer.clipTime) > 0.1) {
-          video.currentTime = layer.clipTime;
+    overlayMediaLayers.forEach((layer) => {
+      const mediaEl = overlayVideoRefs.current.get(layer.id);
+      if (mediaEl && layer.clipTime !== undefined) {
+        if (Math.abs(mediaEl.currentTime - layer.clipTime) > 0.1) {
+          mediaEl.currentTime = layer.clipTime;
         }
       }
     });
@@ -269,7 +269,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
       {/* Base video layer (V1) - rendered separately for stability */}
       {foundBaseLayer && (
         <video
-          key="base-video"
+          key={`base-video-${foundBaseLayer.url}`}
           ref={videoRef}
           src={foundBaseLayer.url}
           className={`absolute inset-0 w-full h-full ${videoFitClass}`}
@@ -290,7 +290,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
         if (layer.type === 'video') {
           return (
             <video
-              key={layer.id}
+              key={`${layer.id}-${layer.url}`}
               ref={(el) => {
                 if (el) {
                   overlayVideoRefs.current.set(layer.id, el);
@@ -336,7 +336,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
                 className="absolute cursor-grab active:cursor-grabbing"
                 style={{
                   width: `${scale * 100}%`,
-                  bottom: `calc(10% + ${yOffset}px)`,
+                  top: `calc(70% + ${yOffset}px)`,
                   left: `calc(50% + ${xOffset}px)`,
                   transform: 'translateX(-50%)',
                   zIndex: baseZIndex + 100,
@@ -388,6 +388,34 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
               words={layer.captionWords}
               style={layer.captionStyle}
               currentTime={layer.clipTime}
+            />
+          );
+        }
+
+        // Audio layers - invisible but play audio synced to timeline
+        if (layer.type === 'audio') {
+          return (
+            <audio
+              key={`audio-${layer.id}`}
+              ref={(el) => {
+                if (el) {
+                  overlayVideoRefs.current.set(layer.id, el as unknown as HTMLVideoElement);
+                } else {
+                  overlayVideoRefs.current.delete(layer.id);
+                }
+              }}
+              src={layer.url}
+              preload="auto"
+              onLoadedData={(e) => {
+                const audio = e.currentTarget;
+                if (layer.clipTime !== undefined) {
+                  audio.currentTime = layer.clipTime;
+                }
+                if (isPlaying) {
+                  audio.play().catch(() => {});
+                }
+              }}
+              style={{ display: 'none' }}
             />
           );
         }

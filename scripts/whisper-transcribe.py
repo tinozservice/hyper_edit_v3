@@ -72,5 +72,7 @@ if __name__ == "__main__":
     try:
         transcribe(audio_file, model_size)
     except Exception as e:
-        print(json.dumps({"error": str(e)}))
+        error_msg = str(e)
+        print(f"Error: {error_msg}", file=sys.stderr)
+        print(json.dumps({"error": error_msg}))
         sys.exit(1)
