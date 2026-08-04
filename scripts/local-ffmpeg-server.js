@@ -1,5 +1,5 @@
 import http from 'http';
-import { spawn, execSync } from 'child_process';
+import { spawn, execSync, spawnSync } from 'child_process';
 import { createWriteStream, createReadStream, unlinkSync, mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -31,6 +31,38 @@ loadEnvVars();
 // Map FAL_API_KEY to FAL_KEY for backward compatibility
 if (process.env.FAL_API_KEY && !process.env.FAL_KEY) {
   process.env.FAL_KEY = process.env.FAL_API_KEY;
+}
+
+// Calls Claude Sonnet 5 directly over the Messages API. Used for the actual
+// chat/prompt orchestration in DiCaprio (prompt enhancement) and CreatorOS
+// (command planning) — Director's orchestration lives in the Cloudflare
+// Worker (src/worker/index.ts), which has its own copy of this helper.
+// Deeper multimodal helpers elsewhere in this file (video/transcript
+// analysis, animation JSX generation) still use Gemini intentionally.
+async function callClaude(apiKey, system, userMessage, maxTokens = 1024) {
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-5',
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: 'user', content: userMessage }],
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Claude API error (${response.status}): ${errText}`);
+  }
+
+  // Sonnet 5 puts extended-thinking blocks first — find the actual text block, not content[0].
+  const data = await response.json();
+  return data.content?.find((block) => block.type === 'text')?.text ?? '';
 }
 
 const PORT = 3333;
@@ -5349,7 +5381,7 @@ async function handleGenerateVideo(req, res, sessionId) {
     return;
   }
 
-  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
 
   try {
     const body = await parseBody(req);
@@ -5381,12 +5413,11 @@ async function handleGenerateVideo(req, res, sessionId) {
     console.log(`[${jobId}] Source image: ${imageAsset.filename}`);
     console.log(`[${jobId}] Duration: ${duration}s`);
 
-    // Enhance prompt using Gemini for better video generation
+    // Enhance prompt using Claude for better video generation
     let enhancedPrompt = prompt;
-    if (geminiApiKey) {
+    if (anthropicApiKey) {
       try {
         console.log(`[${jobId}] Enhancing prompt with DiCaprio AI...`);
-        const ai = new GoogleGenAI({ apiKey: geminiApiKey });
 
         const systemPrompt = `You are DiCaprio, an expert AI prompt engineer specializing in image-to-video generation. Your role is to transform simple motion requests into detailed, cinematic prompts that produce stunning videos.
 
@@ -5414,15 +5445,8 @@ Output: "Cinematic slow zoom in with subtle parallax movement, gentle ambient mo
 Input: "zoom out"
 Output: "Epic reveal shot with slow cinematic zoom out, camera gently pulling back to reveal the full scene, subtle atmospheric haze and soft light flares, smooth dolly movement with slight vertical lift"`;
 
-        const result = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
-          contents: [
-            { role: 'user', parts: [{ text: systemPrompt }] },
-            { role: 'user', parts: [{ text: `Enhance this video motion prompt: "${prompt}"` }] }
-          ],
-        });
-
-        enhancedPrompt = result.candidates[0].content.parts[0].text.trim();
+        const result = await callClaude(anthropicApiKey, systemPrompt, `Enhance this video motion prompt: "${prompt}"`, 800);
+        enhancedPrompt = result.trim();
         console.log(`[${jobId}] Enhanced prompt: ${enhancedPrompt.substring(0, 100)}...`);
       } catch (e) {
         console.log(`[${jobId}] Prompt enhancement failed, using original: ${e.message}`);
@@ -5581,7 +5605,7 @@ async function handleRestyleVideo(req, res, sessionId) {
     return;
   }
 
-  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
 
   try {
     const body = await parseBody(req);
@@ -5612,35 +5636,19 @@ async function handleRestyleVideo(req, res, sessionId) {
     console.log(`[${jobId}] User prompt: ${prompt}`);
     console.log(`[${jobId}] Source video: ${videoAsset.filename}`);
 
-    // Enhance prompt using Gemini for better style transfer
+    // Enhance prompt using Claude for better style transfer
     let enhancedPrompt = prompt;
-    if (geminiApiKey) {
+    if (anthropicApiKey) {
       try {
         console.log(`[${jobId}] Enhancing style prompt with AI...`);
-        const ai = new GoogleGenAI({ apiKey: geminiApiKey });
 
-        const result = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
-          contents: [{
-            role: 'user',
-            parts: [{
-              text: `You are an expert at writing prompts for AI video style transfer. Transform this simple style request into a detailed, cinematic prompt that will produce stunning results.
-
-User request: "${prompt}"
-
-Write a detailed prompt describing the visual style. Include:
-- Color grading and mood
-- Texture and grain quality
-- Lighting style
-- Overall aesthetic
-- Any specific visual effects
-
-Return ONLY the enhanced prompt, no explanations.`
-            }]
-          }],
-        });
-
-        enhancedPrompt = result.candidates[0].content.parts[0].text.trim();
+        const result = await callClaude(
+          anthropicApiKey,
+          'You are an expert at writing prompts for AI video style transfer. Transform the user\'s simple style request into a detailed, cinematic prompt that will produce stunning results. Include color grading and mood, texture and grain quality, lighting style, overall aesthetic, and any specific visual effects. Return ONLY the enhanced prompt, no explanations.',
+          `User request: "${prompt}"`,
+          800
+        );
+        enhancedPrompt = result.trim();
         console.log(`[${jobId}] Enhanced prompt: ${enhancedPrompt.substring(0, 100)}...`);
       } catch (e) {
         console.log(`[${jobId}] Prompt enhancement failed, using original: ${e.message}`);
@@ -7838,6 +7846,376 @@ async function handleProcessAsset(req, res, sessionId) {
 
 // ============== SERVER ==============
 
+// ============================================================
+// CreatorOS Agent — publishes rendered timelines to social media via
+// the `creatoros` CLI (wraps @zernio/cli, see node_modules/@creatoros/cli).
+// The API key is supplied by the user through the CreatorOS chat panel and
+// persisted by the CLI itself to ~/.zernio/config.json — this server never
+// stores it, it only forwards it to `creatoros`/`zernio` subprocesses.
+// ============================================================
+const CREATOROS_BIN = join(process.cwd(), 'node_modules', '@creatoros', 'cli', 'dist', 'index.js');
+const CREATOROS_KEY_RE = /^sk_[0-9a-fA-F]{64}$/;
+const CREATOROS_DESTRUCTIVE_RE = /:(delete|cancel)$/;
+
+let creatorOSState = { initialized: false, maskedKey: null, accountSummary: null };
+
+function maskCreatorOSKey(key) {
+  if (!key || key.length < 8) return 'sk_...';
+  return `sk_...${key.slice(-4)}`;
+}
+
+// Run a creatoros/zernio CLI command, capturing output instead of streaming it.
+function runCreatorOS(args, extraEnv = {}) {
+  // Video publishes (posts:create with --media) can take several minutes —
+  // the platform side processes/transcodes before confirming. A short
+  // timeout here kills the CLI process before it sees that confirmation,
+  // even though the post already went through server-side. 10 minutes gives
+  // real headroom without hanging forever on a genuinely stuck command.
+  const result = spawnSync(process.execPath, [CREATOROS_BIN, ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, CREATOROS_NO_BANNER: '1', ...extraEnv },
+    cwd: process.cwd(),
+    timeout: 600000,
+  });
+  const timedOut = result.signal != null && result.status == null;
+  return {
+    status: result.status ?? 1,
+    stdout: (result.stdout || '').trim(),
+    stderr: (result.stderr || '').trim(),
+    timedOut,
+  };
+}
+
+function tryParseJson(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+let creatorOSReferenceDocs = null;
+function loadCreatorOSReferenceDocs() {
+  if (creatorOSReferenceDocs) return creatorOSReferenceDocs;
+  const parts = [];
+  try {
+    parts.push('## Zernio CLI command reference (creatoros wraps this 1:1 — identical flags)\n\n' +
+      readFileSync(join(process.cwd(), 'node_modules', '@zernio', 'cli', 'SKILL.md'), 'utf8'));
+  } catch { /* not installed */ }
+  try {
+    parts.push('## CreatorOS standing rules\n\n' +
+      readFileSync(join(process.cwd(), 'creatoros', 'CLAUDE.md'), 'utf8'));
+  } catch { /* not scaffolded */ }
+  creatorOSReferenceDocs = parts.join('\n\n---\n\n');
+  return creatorOSReferenceDocs;
+}
+
+// Normalize platform names for matching a user's requested platforms against
+// real connected-account platform values — case-insensitive, with "x" as an
+// alias for "twitter" since the CLI/backend still uses the old platform key.
+function normalizeCreatorOSPlatform(platform) {
+  const lower = String(platform || '').trim().toLowerCase();
+  return lower === 'x' ? 'twitter' : lower;
+}
+
+// Substitute {{RENDER_PATH}}, {{MEDIA_URL}}, {{ACCOUNT_IDS}} tokens with real values.
+function substituteCreatorOSTokens(value, context) {
+  if (typeof value !== 'string') return value;
+  return value.replace(/\{\{(RENDER_PATH|MEDIA_URL|ACCOUNT_IDS)\}\}/g, (_, key) => context[key] ?? '');
+}
+
+// Reconnect verification for the "remember me" flow — the CreatorOS panel
+// only ever calls this when its own localStorage flag confirms this browser
+// already completed a real POST /creatoros/init through this chat before.
+// It is NOT used for first-load detection: a fresh browser/user always gets
+// the "what's your API key?" greeting regardless of what this returns.
+// This re-derives from the CLI's own persisted ~/.zernio/config.json so the
+// "connected" state survives this dev server restarting, not just page reloads.
+async function handleCreatorOSStatus(req, res) {
+  if (!creatorOSState.initialized) {
+    const result = runCreatorOS(['accounts:list']);
+    if (result.status === 0) {
+      const parsed = tryParseJson(result.stdout);
+      const list = Array.isArray(parsed) ? parsed : (parsed?.accounts || parsed?.data || []);
+      creatorOSState = {
+        initialized: true,
+        maskedKey: creatorOSState.maskedKey,
+        accountSummary: list.map(a => ({ platform: a.platform || a.type || 'unknown', username: a.username || a.name || a.handle })),
+      };
+    }
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  res.end(JSON.stringify(creatorOSState));
+}
+
+async function handleCreatorOSInit(req, res, sessionId) {
+  try {
+    const body = await parseBody(req);
+    const apiKey = (body.apiKey || '').trim();
+
+    if (!CREATOROS_KEY_RE.test(apiKey)) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: "That doesn't look like a CreatorOS API key (expected sk_ + 64 hex characters). Check the CreatorOS iOS app → Settings → API Key." }));
+      return;
+    }
+
+    console.log(`[${sessionId}] === CREATOR OS: INIT ===`);
+    const check = runCreatorOS(['auth:check'], { CREATOROS_API_KEY: apiKey });
+    if (check.status !== 0) {
+      const parsed = tryParseJson(check.stdout) || tryParseJson(check.stderr);
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: `API key was rejected${parsed?.message ? `: ${parsed.message}` : ''}.` }));
+      return;
+    }
+
+    const persist = runCreatorOS(['auth:set', '--key', apiKey]);
+    if (persist.status !== 0) {
+      res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: `Key validated but could not be saved: ${persist.stderr || 'unknown error'}` }));
+      return;
+    }
+
+    const accountsResult = runCreatorOS(['accounts:list']);
+    const parsedAccounts = tryParseJson(accountsResult.stdout);
+    const accountList = Array.isArray(parsedAccounts) ? parsedAccounts
+      : (parsedAccounts?.accounts || parsedAccounts?.data || []);
+    const accountSummary = accountList.map(a => ({
+      platform: a.platform || a.type || 'unknown',
+      username: a.username || a.name || a.handle || undefined,
+    }));
+
+    creatorOSState = {
+      initialized: true,
+      maskedKey: maskCreatorOSKey(apiKey),
+      accountSummary,
+    };
+
+    console.log(`[${sessionId}] CreatorOS initialized — ${accountList.length} account(s) connected`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ success: true, maskedKey: creatorOSState.maskedKey, accountSummary }));
+  } catch (error) {
+    console.error(`[${sessionId}] CreatorOS init error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Chat jobs run in the background so the frontend can poll for live,
+// step-by-step progress instead of waiting on one giant response — video
+// publishes can take minutes, so a synchronous request/response would leave
+// the whole chat looking frozen until the very end.
+const creatorOSJobs = new Map();
+
+async function handleCreatorOSChatStart(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  if (!creatorOSState.initialized) {
+    res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'CreatorOS is not connected yet. Paste your API key first.' }));
+    return;
+  }
+
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+  if (!anthropicApiKey) {
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'ANTHROPIC_API_KEY not configured in .dev.vars — required to plan CreatorOS actions.' }));
+    return;
+  }
+
+  try {
+    const body = await parseBody(req);
+    const prompt = (body.prompt || '').trim();
+    if (!prompt) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'prompt is required' }));
+      return;
+    }
+
+    const jobId = randomUUID();
+    creatorOSJobs.set(jobId, { status: 'planning', message: '', steps: [] });
+
+    runCreatorOSChatJob(sessionId, prompt, jobId, anthropicApiKey).catch(err => {
+      const job = creatorOSJobs.get(jobId);
+      if (job) {
+        job.status = 'error';
+        job.error = err.message;
+      }
+      console.error(`[${sessionId}] CreatorOS chat job error:`, err.message);
+    });
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ jobId }));
+  } catch (error) {
+    console.error(`[${sessionId}] CreatorOS chat start error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+function handleCreatorOSChatStatus(req, res, jobId) {
+  const job = creatorOSJobs.get(jobId);
+  if (!job) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Job not found' }));
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  res.end(JSON.stringify(job));
+  if (job.status === 'complete' || job.status === 'error') {
+    creatorOSJobs.delete(jobId);
+  }
+}
+
+async function runCreatorOSChatJob(sessionId, prompt, jobId, anthropicApiKey) {
+  const job = creatorOSJobs.get(jobId);
+  const session = getSession(sessionId);
+  const logId = sessionId.substring(0, 8);
+  console.log(`\n[${logId}] === CREATOR OS: CHAT ===`);
+  console.log(`[${logId}] Prompt: ${prompt}`);
+
+  const hasClips = (session.project?.clips?.length || 0) > 0;
+  const confirming = /\b(yes|confirm|do it|go ahead|proceed)\b/i.test(prompt);
+
+  const systemPrompt = `You are the planning brain for CreatorOS, a social-media publishing agent embedded inside a video editor called HyperEdit. The user talks to you in natural language; you translate that into a strict JSON execution plan that the app runs for real against their connected social accounts. Get it right — these are real posts.
+
+## Primitive actions you can emit
+
+1. { "action": "render" } — renders the user's current video editor timeline to a final MP4 on disk. Later steps refer to this file as the token {{RENDER_PATH}}. ${hasClips ? 'The timeline currently has clips and can be rendered.' : 'WARNING: the timeline is currently EMPTY — do not emit a render step, tell the user to add a clip first instead.'}
+2. { "action": "cli", "command": "media:upload", "args": ["{{RENDER_PATH}}"] } — uploads a local file, returns a hosted URL captured as {{MEDIA_URL}} for later steps.
+3. { "action": "cli", "command": "accounts:list", "args": [], "platforms": [...] } — lists connected social accounts, captured as {{ACCOUNT_IDS}} for later steps. The optional "platforms" array filters which accounts populate {{ACCOUNT_IDS}} — e.g. ["tiktok","instagram"] to only target those two. Use lowercase platform keys: instagram, tiktok, twitter (also accepts "x"), linkedin, facebook, threads, youtube, bluesky, pinterest, reddit, snapchat, telegram, google-business. Omit "platforms" (or leave it empty) when the user means ALL connected accounts ("post everywhere" / "upload to all socials").
+4. { "action": "cli", "command": "<any other zernio subcommand>", "args": ["--flag", "value", ...] } — passthrough to any other command in the reference docs below (posts:create, posts:list, analytics:posts, accounts:health, inbox:*, etc). args is a flat array of CLI tokens, no shell quoting needed. Use {{RENDER_PATH}}, {{MEDIA_URL}}, {{ACCOUNT_IDS}} tokens where earlier steps produced them.
+
+"Upload to all socials" / "post everywhere" means: render, media:upload, accounts:list (no platforms filter), then posts:create with --accounts {{ACCOUNT_IDS}} and --media {{MEDIA_URL}}. "Upload to TikTok and Instagram" / "just post it to X" means the same chain but with "platforms" set on the accounts:list step to exactly the platforms the user named — never guess or add platforms they didn't ask for. Always include a --text caption — write a short, natural one yourself if the user didn't give one.
+
+## Reference docs
+
+${loadCreatorOSReferenceDocs()}
+
+## Safety
+
+Destructive commands (anything ending in :delete or :cancel, e.g. posts:delete, accounts:delete, profiles:delete, contacts:delete, automations:delete) must NEVER be emitted unless the user's message clearly asks for that specific destructive action. ${confirming ? "The user's latest message contains confirming language (yes/confirm/go ahead) — if their PREVIOUS turn already described a destructive action awaiting confirmation, you may now include it." : ''}
+
+## Output format
+
+Return ONLY a JSON object, no markdown fences, no commentary:
+{ "steps": [ ...primitive actions... ], "message": "one short sentence describing what you're about to do, shown to the user before execution" }
+
+If the request is ambiguous, unsafe, or the timeline is empty when a render is needed, return { "steps": [], "message": "<question or explanation for the user>" }.`;
+
+  const raw = (await callClaude(anthropicApiKey, systemPrompt, prompt, 2048)).trim() || '{}';
+  let plan;
+  try {
+    plan = JSON.parse(raw);
+  } catch {
+    job.message = raw;
+    job.status = 'complete';
+    return;
+  }
+
+  job.message = plan.message || '';
+  job.status = 'running';
+
+  const steps = Array.isArray(plan.steps) ? plan.steps : [];
+  const context = {};
+
+  for (const step of steps) {
+    if (step.action === 'render') {
+      const idx = job.steps.push({ label: 'Rendering timeline…', status: 'running' }) - 1;
+      try {
+        const renderRes = await fetch(`http://localhost:${PORT}/session/${sessionId}/render`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ preview: false }),
+        });
+        const renderData = await renderRes.json();
+        if (!renderRes.ok) throw new Error(renderData.error || 'render failed');
+        context.RENDER_PATH = renderData.path;
+        job.steps[idx] = {
+          label: `Rendered timeline (${(renderData.size / 1024 / 1024).toFixed(1)} MB)`,
+          status: 'done',
+        };
+      } catch (err) {
+        job.steps[idx] = { label: `Render failed: ${err.message}`, status: 'error' };
+        break;
+      }
+      continue;
+    }
+
+    if (step.action === 'cli') {
+      const command = String(step.command || '');
+      if (!command) continue;
+
+      if (CREATOROS_DESTRUCTIVE_RE.test(command) && !confirming) {
+        job.steps.push({
+          label: `Skipped "${command}" — destructive action needs explicit confirmation first`,
+          status: 'blocked',
+        });
+        continue;
+      }
+
+      const args = (Array.isArray(step.args) ? step.args : []).map(a => substituteCreatorOSTokens(a, context));
+      const idx = job.steps.push({ label: `creatoros ${command} ${args.join(' ')}`.trim(), status: 'running' }) - 1;
+
+      const cliResult = runCreatorOS([command, ...args]);
+      const parsed = tryParseJson(cliResult.stdout);
+
+      if (cliResult.status !== 0) {
+        const errMsg = cliResult.timedOut
+          ? `timed out waiting for a response after 10 minutes — it may have still succeeded server-side, check "creatoros posts:list" or ask me to check`
+          : (parsed?.message || cliResult.stderr || cliResult.stdout || 'unknown error');
+        job.steps[idx] = { label: `${command} failed: ${errMsg}`, status: 'error' };
+        break;
+      }
+
+      if (command === 'media:upload') {
+        const url = (typeof parsed === 'string' ? parsed : (parsed?.url || parsed?.data?.url || parsed?.mediaUrl));
+        if (url) context.MEDIA_URL = url;
+      }
+      if (command === 'accounts:list') {
+        const list = Array.isArray(parsed) ? parsed : (parsed?.accounts || parsed?.data || []);
+        const requestedPlatforms = Array.isArray(step.platforms) ? step.platforms.filter(Boolean).map(normalizeCreatorOSPlatform) : [];
+        const targetList = requestedPlatforms.length > 0
+          ? list.filter(a => requestedPlatforms.includes(normalizeCreatorOSPlatform(a.platform)))
+          : list;
+        context.ACCOUNT_IDS = targetList.map(a => a._id || a.id).filter(Boolean).join(',');
+
+        if (requestedPlatforms.length > 0 && targetList.length === 0) {
+          const connectedPlatforms = [...new Set(list.map(a => a.platform).filter(Boolean))];
+          job.steps[idx] = {
+            label: `No connected account found for: ${requestedPlatforms.join(', ')}. You have: ${connectedPlatforms.join(', ') || 'none'}.`,
+            status: 'error',
+          };
+          break;
+        }
+        if (requestedPlatforms.length > 0) {
+          const matchedPlatforms = [...new Set(targetList.map(a => a.platform))];
+          const missing = requestedPlatforms.filter(p => !matchedPlatforms.includes(p));
+          job.steps[idx] = {
+            label: missing.length > 0
+              ? `accounts:list done — targeting ${matchedPlatforms.join(', ')} (no connected account for: ${missing.join(', ')})`
+              : `accounts:list done — targeting ${matchedPlatforms.join(', ')}`,
+            status: 'done',
+            output: cliResult.stdout.slice(0, 4000),
+          };
+          continue;
+        }
+      }
+
+      job.steps[idx] = {
+        label: `${command} done`,
+        status: 'done',
+        output: cliResult.stdout.slice(0, 4000),
+      };
+      continue;
+    }
+  }
+
+  job.status = 'complete';
+  console.log(`[${logId}] === CREATOR OS: CHAT COMPLETE (${job.steps.length} step(s)) ===\n`);
+}
+
 const server = http.createServer(async (req, res) => {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -7991,6 +8369,19 @@ const server = http.createServer(async (req, res) => {
     else if (req.method === 'POST' && action === 'giphy/add') {
       await handleGiphyAdd(req, res, sessionId);
     }
+    // CreatorOS agent endpoints
+    else if (req.method === 'GET' && action === 'creatoros/status') {
+      await handleCreatorOSStatus(req, res);
+    }
+    else if (req.method === 'POST' && action === 'creatoros/init') {
+      await handleCreatorOSInit(req, res, sessionId);
+    }
+    else if (req.method === 'POST' && action === 'creatoros/chat/start') {
+      await handleCreatorOSChatStart(req, res, sessionId);
+    }
+    else if (req.method === 'GET' && action.startsWith('creatoros/chat/status/')) {
+      handleCreatorOSChatStatus(req, res, action.substring('creatoros/chat/status/'.length));
+    }
     else if (action.startsWith('renders/')) {
       const renderType = action.substring(8); // Remove 'renders/'
       if (req.method === 'GET') {
@@ -8053,5 +8444,10 @@ server.listen(PORT, () => {
   console.log(`   POST /session/:id/analyze-for-animation - Analyze video, return concept for approval`);
   console.log(`   POST /session/:id/generate-contextual-animation - Content-aware animation (transcribes video first)`);
   console.log(`   POST /session/:id/process-asset - Apply FFmpeg command to an asset`);
+  console.log(`\n   Creator OS Agent API:`);
+  console.log(`   GET  /session/:id/creatoros/status - Reconnect check (only used after a prior explicit connect)`);
+  console.log(`   POST /session/:id/creatoros/init - Connect with a CreatorOS API key`);
+  console.log(`   POST /session/:id/creatoros/chat/start - Start a natural-language social publishing job`);
+  console.log(`   GET  /session/:id/creatoros/chat/status/:jobId - Poll live progress of a chat job`);
   console.log(`\n   GET /health - Health check\n`);
 });

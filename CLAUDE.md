@@ -80,7 +80,7 @@ Key endpoints on `localhost:3333`:
 - `POST /session/{id}/generate-video` - Image-to-video via fal.ai (DiCaprio)
 - `POST /session/{id}/restyle-video` - Video-to-video style transfer (DiCaprio)
 - `POST /session/{id}/remove-video-bg` - Background removal (DiCaprio)
-- `POST /session/{id}/generate-image` - Picasso image generation
+- `POST /session/{id}/generate-image` - fal.ai image generation (currently unused by the UI — Picasso agent was removed)
 - `POST /session/{id}/giphy/*` - GIPHY search/trending/add proxy
 - `POST /session/{id}/create-gif` - Animated GIF from image with motion effects
 
@@ -108,17 +108,39 @@ When working on templates, use the `/remotion-best-practices` skill for domain-s
 ## Environment Variables
 
 Required in `.dev.vars` for local development:
-- `GEMINI_API_KEY` - Google AI for editing commands (worker uses `gemini-2.5-flash`)
-- `FAL_API_KEY` - fal.ai for Picasso/DiCaprio (note: server aliases this to `FAL_KEY` for the fal.ai SDK)
+- `ANTHROPIC_API_KEY` - Claude Sonnet 5 (`claude-sonnet-5`), powers the actual chat/prompt orchestration for all three agents: Director's prompt→FFmpeg-command engine (worker `/api/ai-edit*`), DiCaprio's prompt enhancement, Creator OS's command planner
+- `GEMINI_API_KEY` - Google AI, still powers deeper multimodal helpers in `local-ffmpeg-server.js` (video/transcript analysis, Remotion animation JSX generation, chapter detection) that rely on Gemini's native video-file understanding — not swapped to Claude
+- `FAL_API_KEY` - fal.ai for DiCaprio's actual video generation calls (note: server aliases this to `FAL_KEY` for the fal.ai SDK)
 - `GIPHY_API_KEY` - GIF search
 - `OPENAI_API_KEY` - Additional AI features
 
 ## AI Agents
 
-The right panel has three AI agents accessible via tabs. All three panels are always mounted but toggled with `hidden` CSS class to preserve chat state.
+The right panel has three AI agents accessible via tabs. All panels are always mounted but toggled with `hidden` CSS class to preserve chat state.
 - **Director** (AIPromptPanel): Video editing commands, captions, motion graphics, animations
-- **Picasso** (PicassoPanel): Image generation using fal.ai nano-banana-pro model
 - **DiCaprio** (DiCaprioPanel): Video generation with Animate Image (Kling v1.5), Restyle Video (LTX-2 19B), Remove Background (Bria)
+- **Creator OS** (CreatorOSPanel): Publishes the rendered timeline to social media
+
+### Creator OS Agent
+
+Wraps the `@creatoros/cli` npm package (a branded wrapper around `@zernio/cli`, both real dependencies in `node_modules`). The CLI itself is vendored into the repo's runtime via npm, and its bundled skill playbooks + agent surface docs are scaffolded into `creatoros/` and `.claude/commands/` (generated once via `installSkills`/`generateSurfaces` from the package — see git history for the one-off scaffold script; re-run `npx @creatoros/cli sync` to refresh them).
+
+- **Key entry**: the user's first chat message in the panel is treated as their CreatorOS API key (`sk_` + 64 hex chars, from the CreatorOS iOS app → Settings → API Key), not a command. `CreatorOSPanel.tsx` renders that first turn as a password-masked single-line input.
+- **Backend endpoints** (`scripts/local-ffmpeg-server.js`): `POST /session/:id/creatoros/init` (validates via `creatoros auth:check` then persists via `creatoros auth:set` — the key is saved by the CLI itself to `~/.zernio/config.json`; this server never stores it), `POST /session/:id/creatoros/chat`.
+- **Ask-first, remember-after**: a fresh browser (no `hyperedit-creatoros-connected` flag in localStorage) always gets the "what's your API key?" greeting — it never trusts a pre-existing `~/.zernio/config.json` credential on first load. Only after the user explicitly connects through this chat does the frontend set that localStorage flag; on later mounts, its presence is what gates a background call to `GET /session/:id/creatoros/status` to silently re-verify and skip the greeting. This is intentionally a single-user local dev convenience (see `CreatorOSPanel.tsx` header comment) — don't make `/creatoros/status` unconditional again, or the greeting will silently get skipped for users who never connected.
+- **Chat handler**: sends the user's prompt to Claude Sonnet 5 (via `callClaude()`, a plain-`fetch` wrapper around the Anthropic Messages API — no SDK dependency) along with the real `@zernio/cli` `SKILL.md` (command reference) and `creatoros/CLAUDE.md` as grounding context. Claude returns a strict JSON plan of primitive steps (`render`, or `cli` with a command + args), which the server executes for real via `runCreatorOS()` (spawns the local `creatoros` binary). Steps chain together with `{{RENDER_PATH}}` / `{{MEDIA_URL}}` / `{{ACCOUNT_IDS}}` placeholder tokens — e.g. "download the video in the timeline and upload to all socials" becomes render → `media:upload` → `accounts:list` → `posts:create`.
+- **Render step** calls the existing `/session/:id/render` endpoint via an internal loopback `fetch` rather than duplicating the FFmpeg export logic.
+- **Safety**: commands matching `:delete`/`:cancel` are blocked server-side unless the user's message contains explicit confirming language (yes/confirm/go ahead).
+- Requires `ANTHROPIC_API_KEY` in `.dev.vars` for the chat planner; `init`/`status` work without it since they call the CLI directly.
+
+### Claude Sonnet 5 orchestration (Director / DiCaprio / Creator OS)
+
+The three chat-driven agents all delegate their actual prompt understanding to Claude Sonnet 5 (`claude-sonnet-5`) via `ANTHROPIC_API_KEY`, called directly over the Messages API with plain `fetch` (no `@anthropic-ai/sdk` dependency, so it works identically in the Cloudflare Worker and the Node ffmpeg server):
+- **Director**: `src/worker/index.ts` — `callClaude()` there is a separate copy (workers bundle independently from `scripts/local-ffmpeg-server.js`) backing `/api/ai-edit/start` and `/api/ai-edit`, which turn a natural-language edit request into `{"command", "explanation"}` FFmpeg JSON.
+- **DiCaprio**: `handleGenerateVideo` (Kling image-to-video) and `handleRestyleVideo` (LTX-2 style transfer) in `scripts/local-ffmpeg-server.js` use `callClaude()` to expand a short user prompt into a detailed cinematic one before calling fal.ai. `handleRemoveVideoBg` has no prompt to enhance.
+- **Creator OS**: `handleCreatorOSChat`, see above.
+
+This was a deliberate, scoped swap — only the free-text "what does the user want" entry points moved to Claude. The ~20 other `GoogleGenAI`/Gemini call sites elsewhere in `local-ffmpeg-server.js` (transcript/broll analysis, animation JSX generation, chapter detection, contextual/transcript animations) are untouched and still require `GEMINI_API_KEY` — those depend on Gemini's native video-file understanding, which is a separate capability from chat orchestration.
 
 ## UI Layout Conventions
 

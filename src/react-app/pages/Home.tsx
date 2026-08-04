@@ -5,15 +5,15 @@ import AssetLibrary from '@/react-app/components/AssetLibrary';
 import ClipPropertiesPanel from '@/react-app/components/ClipPropertiesPanel';
 import CaptionPropertiesPanel from '@/react-app/components/CaptionPropertiesPanel';
 import AIPromptPanel from '@/react-app/components/AIPromptPanel';
-import PicassoPanel from '@/react-app/components/PicassoPanel';
 import DiCaprioPanel from '@/react-app/components/DiCaprioPanel';
+import CreatorOSPanel from '@/react-app/components/CreatorOSPanel';
 import GifSearchPanel from '@/react-app/components/GifSearchPanel';
 import ResizablePanel from '@/react-app/components/ResizablePanel';
 import ResizableVerticalPanel from '@/react-app/components/ResizableVerticalPanel';
 import TimelineTabs from '@/react-app/components/TimelineTabs';
 import { useProject, Asset, TimelineClip, CaptionStyle } from '@/react-app/hooks/useProject';
 import { useVideoSession } from '@/react-app/hooks/useVideoSession';
-import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Palette, Film } from 'lucide-react';
+import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Film, Rocket } from 'lucide-react';
 import type { TemplateId } from '@/remotion/templates';
 
 interface ChapterData {
@@ -33,7 +33,7 @@ export default function Home() {
   const [previewAssetId, setPreviewAssetId] = useState<string | null>(null);
   const [aspectRatio, setAspectRatio] = useState<'16:9' | '9:16'>('16:9');
   const [autoSnap, setAutoSnap] = useState(true); // Ripple delete mode - shift clips when deleting
-  const [activeAgent, setActiveAgent] = useState<'director' | 'picasso' | 'dicaprio'>('director');
+  const [activeAgent, setActiveAgent] = useState<'director' | 'dicaprio' | 'creatoros'>('director');
   const [showGifSearch, setShowGifSearch] = useState(false);
 
   const videoPreviewRef = useRef<VideoPreviewHandle>(null);
@@ -62,6 +62,7 @@ export default function Home() {
     loadProject,
     renderProject,
     getDuration,
+    ensureSession,
     // Captions
     addCaptionClipsBatch,
     updateCaptionStyle,
@@ -1906,11 +1907,11 @@ export default function Home() {
           side="right"
         >
           <div className="h-full flex flex-col bg-zinc-900/80 backdrop-blur-sm">
-            {/* Agent Tabs — order: Director, DiCaprio, Picasso */}
-            <div className="flex items-center gap-1 px-2 border-b border-zinc-800/50">
+            {/* Agent Tabs — order: Director, DiCaprio, Creator OS */}
+            <div className="flex items-center border-b border-zinc-800/50">
               <button
                 onClick={() => setActiveAgent('director')}
-                className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors ${
+                className={`flex-1 flex items-center justify-center gap-1 px-1.5 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
                   activeAgent === 'director'
                     ? 'text-zinc-200 border-b-2 border-zinc-300 bg-zinc-800/30'
                     : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
@@ -1921,7 +1922,7 @@ export default function Home() {
               </button>
               <button
                 onClick={() => setActiveAgent('dicaprio')}
-                className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors ${
+                className={`flex-1 flex items-center justify-center gap-1 px-1.5 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
                   activeAgent === 'dicaprio'
                     ? 'text-zinc-200 border-b-2 border-zinc-300 bg-zinc-800/30'
                     : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
@@ -1931,15 +1932,15 @@ export default function Home() {
                 DiCaprio
               </button>
               <button
-                onClick={() => setActiveAgent('picasso')}
-                className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors ${
-                  activeAgent === 'picasso'
+                onClick={() => setActiveAgent('creatoros')}
+                className={`flex-1 flex items-center justify-center gap-1 px-1.5 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
+                  activeAgent === 'creatoros'
                     ? 'text-zinc-200 border-b-2 border-zinc-300 bg-zinc-800/30'
                     : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
                 }`}
               >
-                <Palette className="w-3.5 h-3.5" />
-                Picasso
+                <Rocket className="w-3.5 h-3.5" />
+                Creator OS
               </button>
             </div>
 
@@ -1978,15 +1979,6 @@ export default function Home() {
                   editTabClips={activeTabId !== 'main' ? timelineTabs.find(t => t.id === activeTabId)?.clips : undefined}
                 />
               </div>
-              <div className={`absolute inset-0 ${activeAgent === 'picasso' ? '' : 'hidden'}`}>
-                <PicassoPanel
-                  sessionId={session?.sessionId ?? null}
-                  onImageGenerated={(assetId) => {
-                    console.log('Image generated:', assetId);
-                  }}
-                  onRefreshAssets={refreshAssets}
-                />
-              </div>
               <div className={`absolute inset-0 ${activeAgent === 'dicaprio' ? '' : 'hidden'}`}>
                 <DiCaprioPanel
                   sessionId={session?.sessionId ?? null}
@@ -1996,6 +1988,9 @@ export default function Home() {
                   }}
                   onRefreshAssets={refreshAssets}
                 />
+              </div>
+              <div className={`absolute inset-0 ${activeAgent === 'creatoros' ? '' : 'hidden'}`}>
+                <CreatorOSPanel sessionId={session?.sessionId ?? null} ensureSession={ensureSession} />
               </div>
             </div>
           </div>

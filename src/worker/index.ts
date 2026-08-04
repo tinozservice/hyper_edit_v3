@@ -1,48 +1,15 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { GoogleGenAI } from "@google/genai";
 
 interface Env {
-  GEMINI_API_KEY: string;
+  ANTHROPIC_API_KEY: string;
   R2_BUCKET: R2Bucket;
   DB: D1Database;
   MOCHA_USERS_SERVICE_API_URL: string;
   MOCHA_USERS_SERVICE_API_KEY: string;
 }
 
-// In-memory store for pending requests (dev only)
-const pendingRequests = new Map<string, { status: string; result?: any; error?: string }>();
-
-const app = new Hono<{ Bindings: Env }>();
-
-app.use("/*", cors());
-
-// Start an AI edit job - returns immediately with a job ID
-app.post("/api/ai-edit/start", async (c) => {
-  try {
-    const body = await c.req.json();
-    const prompt = body.prompt;
-
-    if (!prompt) {
-      return c.json({ error: "Prompt is required" }, 400);
-    }
-
-    const jobId = crypto.randomUUID();
-    pendingRequests.set(jobId, { status: "processing" });
-
-    // Process in background using waitUntil
-    c.executionCtx.waitUntil(
-      (async () => {
-        try {
-          const ai = new GoogleGenAI({
-            apiKey: c.env.GEMINI_API_KEY,
-          });
-
-          const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: prompt,
-            config: {
-              systemInstruction: `You are a video editing AI assistant that helps users edit their videos using FFmpeg commands.
+const FFMPEG_SYSTEM_PROMPT = `You are a video editing AI assistant that helps users edit their videos using FFmpeg commands.
 
 When the user describes what they want to do with their video, you should:
 1. Understand the editing request
@@ -51,7 +18,7 @@ When the user describes what they want to do with their video, you should:
 
 IMPORTANT: Always use "input.mp4" as the input filename and "output.mp4" as the output filename in your commands.
 
-Return your response as valid JSON with exactly this structure:
+Return ONLY valid JSON with exactly this structure, no markdown fences, no commentary:
 {"command": "the FFmpeg command", "explanation": "simple explanation"}
 
 Common video editing tasks:
@@ -74,22 +41,78 @@ Common video editing tasks:
 - Remove first 10 seconds: ffmpeg -y -i input.mp4 -ss 10 -c copy output.mp4
 - Convert to MP4 (re-encode): ffmpeg -y -i input.mp4 -c:v libx264 -c:a aac output.mp4
 
-Always use -y flag to overwrite output. Provide safe, valid FFmpeg commands.`,
-              responseMimeType: "application/json",
-            },
-          });
+Always use -y flag to overwrite output. Provide safe, valid FFmpeg commands.`;
 
-          const responseText = response.text || "{}";
-          let result;
-          try {
-            result = JSON.parse(responseText);
-          } catch {
-            const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-            result = jsonMatch
-              ? JSON.parse(jsonMatch[0])
-              : { command: "", explanation: "Failed to parse response" };
-          }
+// Calls Claude Sonnet 5 directly over the Messages API (works in the Workers
+// runtime without an SDK — the Anthropic Node SDK isn't guaranteed edge-safe).
+async function callClaude(apiKey: string, system: string, userMessage: string): Promise<string> {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-5",
+      max_tokens: 1500,
+      system,
+      messages: [{ role: "user", content: userMessage }],
+    }),
+  });
 
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Claude API error (${response.status}): ${errText}`);
+  }
+
+  // Sonnet 5 puts extended-thinking blocks first — find the actual text block, not content[0].
+  const data = (await response.json()) as { content?: Array<{ type: string; text?: string }> };
+  return data.content?.find((block) => block.type === "text")?.text ?? "";
+}
+
+interface FFmpegCommandResult {
+  command: string;
+  explanation: string;
+}
+
+function parseFFmpegResponse(responseText: string): FFmpegCommandResult {
+  try {
+    return JSON.parse(responseText);
+  } catch {
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    return jsonMatch
+      ? JSON.parse(jsonMatch[0])
+      : { command: "", explanation: "Failed to parse response" };
+  }
+}
+
+// In-memory store for pending requests (dev only)
+const pendingRequests = new Map<string, { status: string; result?: FFmpegCommandResult; error?: string }>();
+
+const app = new Hono<{ Bindings: Env }>();
+
+app.use("/*", cors());
+
+// Start an AI edit job - returns immediately with a job ID
+app.post("/api/ai-edit/start", async (c) => {
+  try {
+    const body = await c.req.json();
+    const prompt = body.prompt;
+
+    if (!prompt) {
+      return c.json({ error: "Prompt is required" }, 400);
+    }
+
+    const jobId = crypto.randomUUID();
+    pendingRequests.set(jobId, { status: "processing" });
+
+    // Process in background using waitUntil
+    c.executionCtx.waitUntil(
+      (async () => {
+        try {
+          const responseText = await callClaude(c.env.ANTHROPIC_API_KEY, FFMPEG_SYSTEM_PROMPT, prompt);
+          const result = parseFFmpegResponse(responseText);
           pendingRequests.set(jobId, { status: "complete", result });
         } catch (error) {
           console.error("AI edit error:", error);
@@ -140,48 +163,8 @@ app.post("/api/ai-edit", async (c) => {
       return c.json({ error: "Prompt is required" }, 400);
     }
 
-    const ai = new GoogleGenAI({
-      apiKey: c.env.GEMINI_API_KEY,
-    });
-
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: prompt,
-      config: {
-        systemInstruction: `You are a video editing AI assistant that helps users edit their videos using FFmpeg commands.
-
-When the user describes what they want to do with their video, you should:
-1. Understand the editing request
-2. Generate the appropriate FFmpeg command to accomplish it
-3. Explain what the command will do in simple terms
-
-IMPORTANT: Always use "input.mp4" as the input filename and "output.mp4" as the output filename in your commands.
-
-Return your response as valid JSON with exactly this structure:
-{"command": "the FFmpeg command", "explanation": "simple explanation"}
-
-Common video editing tasks:
-- Remove dead air/silence: ffmpeg -y -i input.mp4 -af "silenceremove=start_periods=1:start_duration=0.5:start_threshold=-40dB:stop_periods=-1:stop_duration=0.5:stop_threshold=-40dB,asetpts=N/SR/TB" -vf "setpts=N/FRAME_RATE/TB" -shortest output.mp4
-- Trim/cut: ffmpeg -y -i input.mp4 -ss 00:00:10 -to 00:00:30 -c copy output.mp4
-- Speed up 2x: ffmpeg -y -i input.mp4 -filter:v "setpts=0.5*PTS" -filter:a "atempo=2.0" output.mp4
-- Remove background noise: ffmpeg -y -i input.mp4 -af "highpass=f=200,lowpass=f=3000,afftdn=nf=-25" -c:v copy output.mp4
-- Resize: ffmpeg -y -i input.mp4 -vf "scale=1280:720" output.mp4
-
-Always use -y flag to overwrite output. Provide safe, valid FFmpeg commands.`,
-        responseMimeType: "application/json",
-      },
-    });
-
-    const responseText = response.text || "{}";
-    let result;
-    try {
-      result = JSON.parse(responseText);
-    } catch {
-      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-      result = jsonMatch
-        ? JSON.parse(jsonMatch[0])
-        : { command: "", explanation: "Failed to parse response" };
-    }
+    const responseText = await callClaude(c.env.ANTHROPIC_API_KEY, FFMPEG_SYSTEM_PROMPT, prompt);
+    const result = parseFFmpegResponse(responseText);
 
     return c.json({ success: true, ...result });
   } catch (error) {

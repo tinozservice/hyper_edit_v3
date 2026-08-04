@@ -1,0 +1,15 @@
+{
+  "_comment": "Optional escape hatch for chat apps (e.g. Claude Desktop). The CLI + skills path (creatoros/CLAUDE.md) is recommended. Paste your API key from the CreatorOS iOS app (Settings → API Key) below — CreatorOS never writes your key into workspace files.",
+  "mcpServers": {
+    "creatoros": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "zernio-mcp"
+      ],
+      "env": {
+        "ZERNIO_API_KEY": "PASTE_YOUR_KEY_HERE"
+      }
+    }
+  }
+}
