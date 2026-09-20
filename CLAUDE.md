@@ -52,8 +52,8 @@ The `useProject()` hook in `src/react-app/hooks/useProject.ts` is the central st
 - **TimelineTabs**: Each tab stores its own `clips: TimelineClip[]` separately. `activeClips` in Home.tsx switches between main `clips` and `tab.clips`. All move/resize/delete operations must check `activeTabId !== 'main'` and dispatch to `updateTabClips` instead.
 
 **Critical patterns:**
-- The hook uses parallel refs (`tracksRef`, `clipsRef`, `settingsRef`) synced via `useEffect` so debounced/async operations read latest state without stale closures. This is essential for `saveProject` and `renderProject`.
-- Session ID is persisted in `localStorage` under key `clipwise-session`. If the FFmpeg server restarts, the stored session may be invalid (404), in which case localStorage is cleared and a new session is created on next asset upload.
+- The hook uses parallel refs (`tracksRef`, `clipsRef`, `settingsRef`, `sessionRef`) synced via `useEffect` so debounced/async operations read latest state without stale closures. This is essential for `saveProject` and `renderProject`.
+- `ensureSession()` and `refreshAssets()` read `sessionRef`, not the `session` closure, so an agent that creates the session and refreshes assets in the same action (Obsidian import as the first asset) actually sees the new asset. Session ID is persisted in `localStorage` under key `clipwise-session`. If the FFmpeg server restarts, the stored session may be invalid (404), in which case localStorage is cleared and a new session is created on next asset upload.
 - Tracks are always initialized client-side (never loaded from server) to guard against outdated server data.
 - Auto-save is intentionally disabled to prevent excessive saves during drag operations. Saves must be triggered explicitly via `saveProject()`.
 - `refreshAssets` appends `?v=Date.now()` to `streamUrl` for cache-busting after server-side file modifications.
@@ -113,19 +113,42 @@ Required in `.dev.vars` for local development:
 - `GEMINI_API_KEY` - Google AI, still powers deeper multimodal helpers in `local-ffmpeg-server.js` (video/transcript analysis, Remotion animation JSX generation, chapter detection) that rely on Gemini's native video-file understanding — not swapped to Claude
 - `FAL_API_KEY` - fal.ai for DiCaprio's actual video generation calls (note: server aliases this to `FAL_KEY` for the fal.ai SDK)
 - `GIPHY_API_KEY` - GIF search
-- `OPENAI_API_KEY` - Additional AI features
+- `OPENAI_API_KEY` - Whisper fallback and Director voice replies (OpenAI TTS `tts-1`; without it voice mode falls back to browser `speechSynthesis`)
+- `TYPESAFE_API_KEY` - Jev (TypeSafe System One). Powers Director workflow routing and Obsidian search reranking. Optional: every Jev call site degrades to keyword logic when unset. Key from https://console.typesafe.ai/keys
+- `OBSIDIAN_VAULT_PATH` - Optional override for the Obsidian agent's vault (defaults to the Marketing OS Broll vault path hardcoded in `scripts/obsidian-agent.js`)
 
 ## AI Agents
 
-The right panel has four tabs (three chat agents plus the Shorts generator). All panels are always mounted but toggled with `hidden` CSS class to preserve chat state.
+The right panel has five tabs (four chat agents plus the Shorts generator). All panels are always mounted but toggled with `hidden` CSS class to preserve chat state.
 - **Director** (AIPromptPanel): Video editing commands, captions, motion graphics, animations
+- **Obsidian** (ObsidianPanel): Jev the media agent over the Marketing OS Broll vault; singular asks import one file, plural asks list them all (see below)
 - **DiCaprio** (DiCaprioPanel): Video generation with Animate Image (Kling v1.5), Restyle Video (LTX-2 19B), Remove Background (Bria)
 - **Creator OS** (CreatorOSPanel): Publishes the rendered timeline to social media
 - **Shorts** (ShortsPanel): Not a chat agent — a form that finds viral moments in a long video and cuts vertical shorts (see Shorts Generator below)
 
+### Obsidian Agent = Jev the media agent (ObsidianPanel)
+
+**Every media lookup goes through Jev.** Never hunt for logos online or guess vault paths: ask Jev in plain English and use the `file` it returns. Jev sits on the **Marketing OS Broll** vault (`~/Documents/Documents - My Mac (2)/Media /Marketing OS Broll/Marketing OS Broll`, note the trailing space in "Media "), a plain folder where every media file has a sidecar `.md` note with frontmatter (`name`, `type`, `pillar`, `brand`, `kind`, `file`, `poster`, `aliases`, `tags`, `colors`, `description`, dimensions, duration). Pillars: `ai-companies` (third-party marks, one hub folder per company), `brand-assets` (our own: creator-os, hoops-ai, no-code-academy, and persona profile pictures), `video-broll` (real clips with `.poster.jpg` frames). Kinds: `logo`, `icon`, `profile`, `clip`.
+
+- **Endpoint**: `POST /jev` with `{ "message": "..." }` (also `POST /session/:id/obsidian/search`). Response: `{ media: true, mode: 'single'|'all', rows, total, more, intent, jev }`. Each row: `id`, `name`, `brand`, `kind`, `type`, `file` (vault-relative), `poster`, `size`, `width`, `height`, `duration`, `thumb` (URL on this server). Absolute path = vault path + `file`. `POST /session/:id/obsidian/import` with `{ itemIds }` copies rows into the session as assets.
+- **Singular vs plural is the contract.** "the claude logo" → exactly one row (the best) plus `more`. "claude logos" → all 13. Plural words: logos, icons, clips, videos, pictures, avatars, assets, marks, files, all, every, each, multiple, footage, b-roll. Row zero of a plural answer equals the singular pick. The panel auto-imports a singular pick and lists a plural one.
+- **How it works** (`queryVault` in `scripts/obsidian-agent.js`): one ~6k-token Jev call reads intent (plural Noul, kind/pillar/brand Choices over the live brand catalog, descriptive Noul). Code then applies the rules: family expansion for AI-company hubs (any brand in a hub returns the whole hub, exact brand first; exact-brand items elsewhere are included, e.g. the Claude tile), our own brand assets stay narrow, logo == icon, clips only when asked for clips/footage, brand narrowing only when a brand or alias is actually said, no brand → whole pillar. Ranking: exact brand > canonical "Brand logo" name > plain mark > logo > icon > profile > clip > resolution. A second per-item Jev call (Noul per candidate + best Choice) runs only for descriptive asks ("the pink jev logo", "basketball footage") or an unnamed-brand singular pick. Typical: 1 call, 200–600ms.
+- **The server never reads the iCloud folder directly.** That Documents folder is iCloud-synced and macOS evicts its files to `dataless` placeholders whenever disk is tight (this Mac runs near full); a plain `readFileSync` on an evicted file blocks until iCloud re-downloads it, which froze the whole Node server. `syncMirror()` in `scripts/obsidian-agent.js` spawns `rsync -a --delete` from the vault into `~/.clipwise/vault-mirror/<vault name>` (non-synced, cannot be evicted) as a child process, at server start and whenever the index is older than 5 minutes; `loadIndex()`, thumbnails and imports all read the mirror. `GET /session/:id/obsidian/status` exposes `mirror.{syncing,lastSyncedAt,error}` and the panel polls it while syncing. If asks return "still syncing", iCloud is slow-walking downloads (~1 file/s); freeing disk space stops the evictions.
+- **Never swap brands.** An empty result for a named brand means it isn't on file; say so rather than substituting another company's mark. Keyword fallback exists only when `TYPESAFE_API_KEY` is unset.
+
+### Director voice mode + Jev routing
+
+The Director no longer requires a video to be uploaded before you can talk to it: the input, send, attach and voice controls are always enabled, and workflows that need footage reply with "upload a video first" instead. The Director can be driven voice-to-voice. `src/react-app/hooks/useVoiceDirector.ts` wraps the browser Web Speech API for input (Chrome/Edge/Safari; no server round-trip) and speaks replies via `POST /director/tts` (OpenAI `tts-1`, voice `onyx`, overridable with `DIRECTOR_TTS_VOICE`/`DIRECTOR_TTS_MODEL`), falling back to `speechSynthesis` on any non-200. In `AIPromptPanel.tsx`:
+- The mic button is push-to-talk: the final transcript is submitted through `handleSubmit(undefined, text)` (the `overrideText` parameter exists for this).
+- The headphones button toggles **voice mode**: every new assistant message is spoken (`toSpeakable` strips markdown/code and caps length), then the mic re-arms automatically unless the panel is busy. The mic is never open while the Director is speaking.
+- Workflow routing asks Jev first: `routeWithJev` posts the prompt plus editor context to `POST /director/route`, where `handleDirectorRoute` asks one Choice over the 13 `WorkflowType`s (descriptions in `DIRECTOR_WORKFLOWS`) and one Noul ("does this refer to the existing animation?") in a single call, applies a deterministic override toward `edit-animation` when an animation is in context, and returns `{workflow, confidence, latencyMs}`. The client uses it only when `confidence >= 0.35` and the call answers within 4s; otherwise the keyword `determineWorkflow` decides. Both results are logged to the console for comparison.
+- **Obsidian voice mode**: `ObsidianPanel.tsx` uses the same hook with a `VoicePersona` (`BUTLER`): OpenAI voice `fable` with butler delivery `instructions` (the server switches to `gpt-4o-mini-tts` whenever instructions are sent, since `tts-1` ignores them), and a browser fallback that prefers the macOS "Grandpa (English (UK))" / "Daniel" en-GB voices. Replies are one clipped sentence ("Vercel logo, in your media now. 12 more exist."). In voice mode a singular ask imports its file and a plural ask of ≤15 rows imports all of them; larger plural asks are listed and Jev asks which.
+- **Timeline operations and vault media** (`timeline-op`, `vault-media` workflows): the same routing call also asks Jev for a `DirectorTimelineOp` (operation, target, track, destination track, direction, size, position; see `src/react-app/lib/directorOps.ts`), with numbers (seconds, mm:ss, percentages) parsed by regex in `parseTimelineNumbers`. The client sends the active timeline's clips as labels (`V1 · intro.mp4 · 0:00–0:30`) so Jev can target a clip by name (`clip:<id>`) as well as `selected`, `at_playhead`, `first`, `last`, `all_on_track`, `everything`. `executeDirectorTimelineOp` in Home.tsx runs delete, split, move, trim/extend start/end, set_duration, scale, position, seek, play, pause, clear_track against the active tab through the existing handlers and returns a one-line result for the chat. `placeVaultMedia` asks Jev the media agent (`/session/:id/obsidian/search`), imports the row(s), refreshes assets, and places them: images on V3 at the playhead with a size/position preset (default small, top-right), videos on V1 if V1 is empty else V2, audio on A1; a plural ask lays files out back to back. A confident timeline verb overrides a generic FFmpeg/animation bucket server-side unless an animation is in context.
+- `scripts/jev.js` is the shared plain-`fetch` client (`askJev(state, questions)`, `choice/noul/score` builders, retries 429/529). Ask all questions for one decision in a single request; Jev evaluates them in parallel.
+
 ### Shorts Generator (ShortsPanel)
 
-Fourth tab in the right panel (`ShortsPanel.tsx`). Finds the most viral moments in a long talking video and cuts them into ready-to-post vertical shorts. Built in-house — there is no third-party dependency (a GitHub "shorts generator" repo was evaluated and rejected as malware; do not vendor external code for this).
+Fifth tab in the right panel (`ShortsPanel.tsx`). Finds the most viral moments in a long talking video and cuts them into ready-to-post vertical shorts. Built in-house — there is no third-party dependency (a GitHub "shorts generator" repo was evaluated and rejected as malware; do not vendor external code for this).
 
 Pipeline (`runShortsJob` in `scripts/local-ffmpeg-server.js`, start/poll job pattern like Creator OS):
 1. **Transcribe** via the shared `getOrTranscribeVideo()` (local Whisper, cached per asset in `session.transcriptCache`).
@@ -170,7 +193,7 @@ This was a deliberate, scoped swap — only the free-text "what does the user wa
 
 ## Local Whisper Transcription
 
-Captions use local OpenAI Whisper (`scripts/whisper-transcribe.py`). Setup:
+Captions use local OpenAI Whisper (`scripts/whisper-transcribe.py`). Audio is read via `resolveAudioSource(session, videoAsset, hint)`: the video's own track when it has usable sound, otherwise the A1 audio that `extract-audio` split off it (linked by `sourceAssetId`, or an `audioAssetId` hint from the client). Both `handleTranscribe` (captions) and the shared `getOrTranscribeVideo()` (shorts, GIFs, b-roll) go through it, so a muted V1 never produces the "Output file does not contain any stream" FFmpeg error. Setup:
 ```bash
 pip3 install openai-whisper torch
 ```
@@ -180,12 +203,13 @@ pip3 install openai-whisper torch
 
 ## Dead Air Removal
 
-The remove dead air workflow (`POST /session/{id}/remove-dead-air`) is stable — **do not modify it**. How it works:
+The remove dead air workflow (`POST /session/{id}/remove-dead-air`) is stable — keep the segment-based approach below; change it only deliberately. How it works:
+0. The client sends `assetId` (the asset of the selected or earliest V1 clip, never "first video in the library") and, when the audio was extracted to A1, `audioAssetId`. The server listens to whichever file actually carries sound: the video if it has a usable audio stream (mean above -60dB), else the linked A1 audio asset (matched by `sourceAssetId`). A silent video with no linked audio returns a clear 400.
 1. FFmpeg `silencedetect` finds silence periods (threshold: -26dB, min duration: 0.4s — set in `Home.tsx handleRemoveDeadAir`)
 2. Each non-silent segment is extracted individually with `-ss`/`-t` and re-encoded (`libx264 ultrafast, aac`)
 3. Segments are concatenated with `-c copy` into the final output
-4. The original file is replaced in-place on disk
-5. Frontend calls `refreshAssets()` to get a cache-busted URL and updates the V1 clip duration
+4. The original file is replaced in-place on disk. When silence was read from the A1 audio, that audio file is cut with the identical segment list in one `atrim`+`concat` filter pass (sample-accurate; `aselect` does not drop samples on FFmpeg 8) and replaced in place too, so V1 and A1 stay in sync (`audio: {assetId, duration}` in the response)
+5. Frontend calls `refreshAssets()` to get a cache-busted URL and updates the V1 clip duration, plus the linked A1 clip when `audio` is returned
 
 The segment-based approach (extract + concat) is required — single-pass filter approaches (`select`/`aselect`, `trim`/`atrim`) drop audio streams. The `VideoPreview` component uses a stable `key` on the base video element and manually calls `video.load()` when the source URL changes, preserving browser audio permission from the user's play gesture.
 

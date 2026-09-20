@@ -1,5 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
-import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move } from 'lucide-react';
+import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move, Mic, Headphones, Square } from 'lucide-react';
+import { useVoiceDirector } from '@/react-app/hooks/useVoiceDirector';
+import { formatTime as fmtTime, type DirectorTimelineOp, type VaultPlacement } from '@/react-app/lib/directorOps';
 import type { TimelineClip, Track, Asset } from '@/react-app/hooks/useProject';
 import { MOTION_TEMPLATES, type TemplateId } from '@/remotion/templates';
 import MotionGraphicsPanel from './MotionGraphicsPanel';
@@ -93,6 +95,7 @@ interface BatchAnimationResult {
 }
 
 interface ExtractAudioResult {
+  warning?: string; // e.g. the extracted track is digital silence
   audioAsset: {
     id: string;
     filename: string;
@@ -181,6 +184,10 @@ interface AIPromptPanelProps {
   onExtractAudio?: () => Promise<ExtractAudioResult>;
   onOpenAnimationInTab?: (assetId: string, animationName: string) => string | undefined;
   onEditAnimation?: (assetId: string, editPrompt: string, v1Context?: EditTabV1Context, tabIdToUpdate?: string) => Promise<{ assetId: string; duration: number; sceneCount: number }>;
+  // Timeline arrangement (delete/split/move/trim/scale/position/seek/play) decided by Jev, executed in Home
+  onTimelineOp?: (op: DirectorTimelineOp, prompt: string) => Promise<string>;
+  // Vault media: ask Jev the media agent, import, and place on the timeline
+  onPlaceVaultMedia?: (prompt: string, placement: VaultPlacement) => Promise<string>;
   isApplying?: boolean;
   applyProgress?: number;
   applyStatus?: string;
@@ -215,6 +222,8 @@ export default function AIPromptPanel({
   onExtractAudio,
   onOpenAnimationInTab,
   onEditAnimation,
+  onTimelineOp,
+  onPlaceVaultMedia,
   isApplying,
   applyProgress,
   applyStatus,
@@ -891,6 +900,8 @@ export default function AIPromptPanel({
     | 'contextual-animation' // Animation based on video content
     | 'extract-audio'       // Extract audio to separate track
     | 'ffmpeg-edit'         // Direct FFmpeg video manipulation
+    | 'timeline-op'         // Arrange clips / playback without re-encoding (Jev-filled op)
+    | 'vault-media'         // Pull a logo / clip from the vault onto the timeline
     | 'unknown';            // Need to ask for clarification
 
   interface DirectorContext {
@@ -983,6 +994,23 @@ export default function AIPromptPanel({
         (lower.includes('remove') && lower.includes('audio') && lower.includes('track')) ||
         (lower.includes('audio') && lower.includes('to') && (lower.includes('a1') || lower.includes('track')))) {
       return 'extract-audio';
+    }
+
+    // Vault media + timeline arrangement (Jev normally decides these; this is the offline fallback)
+    if (/\b(logo|logos|icon|icons|avatar|avatars|profile picture|profile pictures|brand mark|from the vault|vault)\b/.test(lower) &&
+        !/\b(logo reveal|logo animation|animate)\b/.test(lower)) {
+      return 'vault-media';
+    }
+    if (/^(play|pause|stop|resume)\b/.test(lower) || /\b(go to|jump to|seek to|skip to|skip forward|skip back)\b/.test(lower)) {
+      return 'timeline-op';
+    }
+    if ((/\b(delete|remove|get rid of)\b/.test(lower) && /\b(clip|it|that|this one|last|first)\b/.test(lower)) ||
+        /\bsplit\b/.test(lower) ||
+        (/\b(move|shift|nudge)\b/.test(lower) && /\b(clip|it|earlier|later|left|right|to v[123]|to a[12])\b/.test(lower)) ||
+        (/\b(trim|shorten|extend|lengthen)\b/.test(lower) && /\b(clip|start|end|beginning|it)\b/.test(lower)) ||
+        (/\bclear\b/.test(lower) && /\btrack\b/.test(lower)) ||
+        (/\b(bigger|smaller|top left|top right|bottom left|bottom right|corner)\b/.test(lower) && !/\banimation\b/.test(lower))) {
+      return 'timeline-op';
     }
 
     // Chapter cuts
@@ -1095,6 +1123,51 @@ export default function AIPromptPanel({
     // Default: for creative/visual requests, prefer animation over FFmpeg
     // Only use ffmpeg-edit when the user clearly wants video manipulation
     return 'create-animation';
+  };
+
+  // Jev (TypeSafe System One) routing: one fast typed judgment on the server.
+  // Returns null when Jev is unconfigured, unreachable, slow, or unsure, in
+  // which case the keyword router above decides.
+  const JEV_MIN_CONFIDENCE = 0.35;
+  const EMPTY_OP: DirectorTimelineOp = { operation: 'none', target: 'none', track: 'none', toTrack: 'none', direction: 'none', size: 'none', position: 'none', seconds: null, time: null, scaleFraction: null };
+  const routeWithJev = async (ctx: DirectorContext): Promise<{ workflow: WorkflowType; confidence: number; latencyMs: number; timelineOp: DirectorTimelineOp } | null> => {
+    const timelineClips = (activeTabId !== 'main' ? editTabClips : clips).map(c => {
+      const a = assets.find(x => x.id === c.assetId);
+      return { id: c.id, label: `${c.trackId} · ${c.trackId === 'T1' ? 'caption' : (a?.filename ?? 'clip')} · ${fmtTime(c.start)}–${fmtTime(c.start + c.duration)}` };
+    });
+    const selectedLabel = selectedClipId ? timelineClips.find(c => c.id === selectedClipId)?.label ?? null : null;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    try {
+      const res = await fetch('http://localhost:3333/director/route', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: ctx.prompt,
+          context: {
+            isOnEditTab: ctx.isOnEditTab,
+            editTabHasAnimation: ctx.editTabHasAnimation,
+            selectedClipIsAiAnimation: ctx.selectedClipIsAiAnimation,
+            hasAiAnimationsOnTimeline: ctx.hasAiAnimationsOnTimeline,
+            hasTimeRange: ctx.hasTimeRange,
+            hasVideo: ctx.hasVideo,
+            clips: timelineClips,
+            currentTime,
+            selectedClipLabel: selectedLabel,
+          },
+        }),
+        signal: controller.signal,
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (!data.configured || !data.workflow || typeof data.confidence !== 'number') return null;
+      if (data.confidence < JEV_MIN_CONFIDENCE) return null;
+      return { workflow: data.workflow as WorkflowType, confidence: data.confidence, latencyMs: data.latencyMs ?? 0, timelineOp: { ...EMPTY_OP, ...(data.timelineOp || {}) } };
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
   };
 
   // Handle chapter cuts workflow
@@ -1950,12 +2023,14 @@ export default function AIPromptPanel({
     }
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!prompt.trim()) return;
+  // `overrideText` lets voice mode submit a transcript directly.
+  const handleSubmit = async (e?: React.FormEvent, overrideText?: string) => {
+    e?.preventDefault();
+    const rawText = (overrideText ?? prompt).trim();
+    if (!rawText) return;
 
     const referenceContext = buildReferenceContext();
-    const userMessage = prompt.trim();
+    const userMessage = rawText;
     const fullMessage = referenceContext + userMessage;
 
     // Check for time range: first use UI selection, then try to parse from prompt text
@@ -2022,8 +2097,12 @@ export default function AIPromptPanel({
       selectedAiAnimationAssetId: selectedClipIsAiAnimation ? selectedClipAsset?.id : undefined,
     };
 
-    const workflow = determineWorkflow(directorContext);
-    console.log('[Director] Determined workflow:', workflow);
+    const keywordWorkflow = determineWorkflow(directorContext);
+    const jevRoute = await routeWithJev(directorContext);
+    const workflow: WorkflowType = jevRoute ? jevRoute.workflow : keywordWorkflow;
+    console.log('[Director] Determined workflow:', workflow, jevRoute
+      ? `(Jev, conf ${jevRoute.confidence.toFixed(2)}, ${jevRoute.latencyMs}ms; keywords said ${keywordWorkflow})`
+      : '(keyword router)');
     console.log('[Director] Full context:', {
       prompt: userMessage.substring(0, 50) + '...',
       isOnEditTab: directorContext.isOnEditTab,
@@ -2049,6 +2128,39 @@ export default function AIPromptPanel({
     // ===========================================
     // Execute the determined workflow
     // ===========================================
+
+    // Timeline arrangement / playback (Jev-filled op, executed in Home)
+    if (workflow === 'timeline-op') {
+      if (!onTimelineOp) return;
+      setIsProcessing(true);
+      try {
+        const msg = await onTimelineOp(jevRoute?.timelineOp ?? EMPTY_OP, userMessage);
+        setChatHistory(prev => [...prev, { type: 'assistant', text: msg }]);
+      } catch (error) {
+        setChatHistory(prev => [...prev, { type: 'assistant', text: `Timeline error: ${error instanceof Error ? error.message : 'Unknown error'}` }]);
+      } finally {
+        setIsProcessing(false);
+      }
+      return;
+    }
+
+    // Vault media: Jev the media agent finds it, we place it
+    if (workflow === 'vault-media') {
+      if (!onPlaceVaultMedia) return;
+      const op = jevRoute?.timelineOp ?? EMPTY_OP;
+      setIsProcessing(true);
+      setProcessingStatus('Asking Jev for the file...');
+      try {
+        const msg = await onPlaceVaultMedia(userMessage, { track: op.toTrack !== 'none' ? op.toTrack : op.track, size: op.size, position: op.position, time: op.time });
+        setChatHistory(prev => [...prev, { type: 'assistant', text: msg }]);
+      } catch (error) {
+        setChatHistory(prev => [...prev, { type: 'assistant', text: `Vault error: ${error instanceof Error ? error.message : 'Unknown error'}` }]);
+      } finally {
+        setIsProcessing(false);
+        setProcessingStatus('');
+      }
+      return;
+    }
 
     // Edit existing animation (Remotion)
     // Priority for asset ID:
@@ -2253,6 +2365,45 @@ export default function AIPromptPanel({
       setIsProcessing(false);
       setProcessingStatus('');
     }
+  };
+
+  // ===========================================
+  // VOICE MODE (voice-to-voice with the Director)
+  // ===========================================
+  const submitRef = useRef(handleSubmit);
+  submitRef.current = handleSubmit;
+  const voice = useVoiceDirector({
+    onTranscript: (text) => {
+      setPrompt('');
+      void submitRef.current(undefined, text);
+    },
+    onInterim: (text) => setPrompt(text),
+  });
+  const voiceModeRef = useRef(voice.voiceMode);
+  voiceModeRef.current = voice.voiceMode;
+  const lastSpokenIndexRef = useRef(-1);
+  const isBusyRef = useRef(false);
+  isBusyRef.current = isProcessing || Boolean(isApplying);
+
+  // Speak each new assistant reply in voice mode, then re-arm the mic.
+  useEffect(() => {
+    if (!voice.voiceMode) { lastSpokenIndexRef.current = chatHistory.length - 1; return; }
+    const lastIndex = chatHistory.length - 1;
+    if (lastIndex <= lastSpokenIndexRef.current) return;
+    const last = chatHistory[lastIndex];
+    if (!last || last.type !== 'assistant') return;
+    lastSpokenIndexRef.current = lastIndex;
+    void (async () => {
+      await voice.speak(last.text);
+      if (voiceModeRef.current && !isBusyRef.current) voice.startListening();
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatHistory, voice.voiceMode]);
+
+  const toggleVoiceMode = () => {
+    if (voice.voiceMode) { voice.setVoiceMode(false); return; }
+    voice.setVoiceMode(true);
+    setChatHistory((prev) => [...prev, { type: 'assistant', text: 'Voice mode on. I\'m listening — tell me what to do with the video.' }]);
   };
 
   const handleApplyEdit = async (command: string, messageIndex: number) => {
@@ -2708,10 +2859,10 @@ export default function AIPromptPanel({
           <textarea
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
-            placeholder={hasVideo ? "Describe your edit..." : "Upload a video first..."}
+            placeholder={hasVideo ? "Describe your edit..." : "Talk to the Director — upload a video or ask Jev for one..."}
             className="w-full px-3 pt-3 pb-2 bg-transparent text-sm resize-none focus:outline-none placeholder:text-zinc-500"
             rows={2}
-            disabled={isProcessing || !hasVideo}
+            disabled={isProcessing}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
@@ -2840,7 +2991,7 @@ export default function AIPromptPanel({
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
-                  disabled={!hasVideo || isProcessing || isUploadingAttachment || !onUploadAttachment}
+                  disabled={isProcessing || isUploadingAttachment || !onUploadAttachment}
                   className={`p-1.5 rounded-md transition-all ${
                     attachedAssets.length > 0
                       ? 'bg-zinc-500/20 text-zinc-400'
@@ -2939,13 +3090,47 @@ export default function AIPromptPanel({
 
               <div className="w-px h-4 bg-zinc-700 mx-1" />
 
-              <span className="text-[10px] text-zinc-500">Enter to send</span>
+              {/* Push-to-talk mic */}
+              <button
+                type="button"
+                onClick={() => (voice.listening ? voice.stopListening() : voice.startListening())}
+                disabled={isProcessing || !voice.supported || voice.speaking}
+                className={`p-1.5 rounded-md transition-all ${
+                  voice.listening
+                    ? 'bg-red-500/20 text-red-400 animate-pulse'
+                    : 'hover:bg-zinc-700 text-zinc-400 hover:text-zinc-300 disabled:opacity-50'
+                }`}
+                title={voice.supported ? (voice.listening ? 'Stop listening' : 'Speak a command') : 'Voice input needs Chrome, Edge or Safari'}
+              >
+                {voice.listening ? <Square className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+              </button>
+
+              {/* Voice-to-voice mode */}
+              <button
+                type="button"
+                onClick={toggleVoiceMode}
+                disabled={!voice.supported}
+                className={`p-1.5 rounded-md transition-all ${
+                  voice.voiceMode
+                    ? 'bg-pink-500/20 text-pink-300'
+                    : 'hover:bg-zinc-700 text-zinc-400 hover:text-zinc-300 disabled:opacity-50'
+                }`}
+                title={voice.voiceMode ? 'Turn off voice mode' : 'Voice mode: talk to the Director and hear it answer'}
+              >
+                <Headphones className="w-4 h-4" />
+              </button>
+
+              <div className="w-px h-4 bg-zinc-700 mx-1" />
+
+              <span className="text-[10px] text-zinc-500">
+                {voice.speaking ? 'Speaking…' : voice.listening ? 'Listening…' : voice.voiceMode ? 'Voice mode' : 'Enter to send'}
+              </span>
             </div>
 
             {/* Send Button */}
             <button
               type="submit"
-              disabled={!prompt.trim() || isProcessing || !hasVideo}
+              disabled={!prompt.trim() || isProcessing}
               className="w-8 h-8 bg-gradient-to-r from-zinc-500 to-zinc-500 disabled:from-zinc-700 disabled:to-zinc-700 rounded-lg flex items-center justify-center transition-all hover:shadow-lg hover:shadow-zinc-500/50 disabled:shadow-none"
             >
               {isProcessing ? (

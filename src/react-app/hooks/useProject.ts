@@ -190,6 +190,10 @@ export function useProject() {
   useEffect(() => { settingsRef.current = settings; }, [settings]);
   useEffect(() => { captionDataRef.current = captionData; }, [captionData]);
   useEffect(() => { timelineTabsRef.current = timelineTabs; }, [timelineTabs]);
+  // Agents (Obsidian, Director) can create the session and refresh assets in the
+  // same tick; a ref keeps those callbacks from closing over a stale null session.
+  const sessionRef = useRef<SessionInfo | null>(session);
+  useEffect(() => { sessionRef.current = session; }, [session]);
 
   // Wrapper to persist session to localStorage
   const setSession = useCallback((sessionOrUpdater: SessionInfo | null | ((prev: SessionInfo | null) => SessionInfo | null)) => {
@@ -349,6 +353,7 @@ export function useProject() {
 
   // Refresh assets from server (useful after server-side asset generation)
   const refreshAssets = useCallback(async (): Promise<Asset[]> => {
+    const session = sessionRef.current;
     if (!session) return [];
 
     const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/assets`);
@@ -942,7 +947,8 @@ export function useProject() {
   // Used by agents that need to interact with the server before the user has
   // uploaded their first asset.
   const ensureSession = useCallback(async (): Promise<string> => {
-    if (session?.sessionId) return session.sessionId;
+    const current = sessionRef.current ?? session;
+    if (current?.sessionId) return current.sessionId;
 
     const createResponse = await fetch(`${LOCAL_FFMPEG_URL}/session/create`, {
       method: 'POST',
@@ -956,9 +962,10 @@ export function useProject() {
       sessionId: createResult.sessionId,
       createdAt: Date.now(),
     };
+    sessionRef.current = newSession;
     setSession(newSession);
     return newSession.sessionId;
-  }, [session]);
+  }, [session, setSession]);
 
   // Close session
   const closeSession = useCallback(async (): Promise<void> => {
