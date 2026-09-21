@@ -2179,7 +2179,7 @@ export default function Home() {
                 }`}
               >
                 <Sparkles className="w-3.5 h-3.5" />
-                Director
+                DIRECTOR JEV
               </button>
               <button
                 onClick={() => setActiveAgent('obsidian')}
@@ -2190,7 +2190,7 @@ export default function Home() {
                 }`}
               >
                 <Database className="w-3.5 h-3.5" />
-                Obsidian
+                Obsidian / JEV
               </button>
               <button
                 onClick={() => setActiveAgent('dicaprio')}

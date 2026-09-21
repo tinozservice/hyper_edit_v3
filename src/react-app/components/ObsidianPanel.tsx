@@ -244,7 +244,7 @@ export default function ObsidianPanel({ ensureSession, onRefreshAssets }: Obsidi
           <div className="w-8 h-8 bg-gradient-to-br from-zinc-400 to-zinc-300 rounded-lg flex items-center justify-center">
             <Database className="w-4 h-4 text-zinc-900" />
           </div>
-          <h2 className="font-semibold">Obsidian</h2>
+          <h2 className="font-semibold">Obsidian / JEV</h2>
           {status?.jev && (
             <span className="ml-auto flex items-center gap-1 text-[10px] text-pink-300 bg-pink-500/10 border border-pink-500/30 rounded-full px-2 py-0.5" title="Jev is the media agent">
               <Zap className="w-2.5 h-2.5" /> Jev
