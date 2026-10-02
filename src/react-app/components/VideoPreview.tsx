@@ -30,7 +30,10 @@ interface ClipLayer {
 interface VideoPreviewProps {
   layers?: ClipLayer[];
   isPlaying?: boolean;
-  aspectRatio?: '16:9' | '9:16';
+  // Dimensi kanvas (settings.width/height proyek). Rasio preview mengikuti
+  // nilai ini, termasuk ukuran custom dari AspectRatioPicker.
+  videoWidth?: number;
+  videoHeight?: number;
   onLayerMove?: (layerId: string, x: number, y: number) => void;
   onLayerSelect?: (layerId: string) => void;
   selectedLayerId?: string | null;
@@ -83,7 +86,8 @@ function getTransformStyles(transform?: ClipTransform, zIndex: number = 0, isDra
 const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
   layers = [],
   isPlaying = false,
-  aspectRatio = '16:9',
+  videoWidth = 1920,
+  videoHeight = 1080,
   onLayerMove,
   onLayerSelect,
   selectedLayerId,
@@ -255,21 +259,25 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
     };
   }, [draggingLayer, dragStart, onLayerMove]);
 
-  // Aspect ratio styles
-  const isVertical = aspectRatio === '9:16';
-  // Use object-contain to show full video without cropping
+  // Canvas di-fit ke tinggi panel (ResizableVerticalPanel) sambil menjaga
+  // rasio width/height proyek, termasuk dimensi custom.
   const videoFitClass = 'object-contain';
+  const containerClass = 'h-full max-h-full w-auto';
+  const containerStyle: React.CSSProperties = { aspectRatio: `${videoWidth} / ${videoHeight}` };
 
-  // Container classes based on aspect ratio. Both modes fit the parent
-  // height so the surrounding ResizableVerticalPanel can grow/shrink the
-  // viewer without breaking aspect ratio.
-  const containerClass = isVertical
-    ? 'h-full max-h-full w-auto aspect-[9/16]'
-    : 'h-full max-h-full w-auto aspect-video';
+  // Separate base video from overlay layers to prevent re-render issues.
+  // Must stay before the early return so hook order never changes.
+  const overlayLayers = useMemo(() =>
+    sortedLayers.filter(l => !(l.trackId === 'V1' && l.type === 'video')),
+    [sortedLayers]
+  );
 
   if (layers.length === 0) {
     return (
-      <div className={`relative ${containerClass} bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10 flex items-center justify-center`}>
+      <div
+        className={`relative ${containerClass} bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10 flex items-center justify-center`}
+        style={containerStyle}
+      >
         <div className="text-center text-zinc-600">
           <Play className="w-12 h-12 mx-auto mb-2 opacity-50" />
           <p className="text-sm">No media to display</p>
@@ -278,16 +286,11 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
     );
   }
 
-  // Separate base video from overlay layers to prevent re-render issues
-  const overlayLayers = useMemo(() =>
-    sortedLayers.filter(l => !(l.trackId === 'V1' && l.type === 'video')),
-    [sortedLayers]
-  );
-
   return (
     <div
       ref={containerRef}
       className={`relative ${containerClass} bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10`}
+      style={containerStyle}
     >
       {/* Base video layer (V1) - rendered separately for stability */}
       {foundBaseLayer && (

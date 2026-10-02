@@ -3,3 +3,6 @@ node_modules/
 .wrangler/
 .dev.vars
 worker-configuration.d.ts
+obsidian/.obsidian
+data/
+obsidian/Media_Projek

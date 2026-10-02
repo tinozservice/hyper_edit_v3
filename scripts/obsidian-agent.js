@@ -16,7 +16,7 @@ import { readFileSync, existsSync, readdirSync, statSync, mkdirSync } from 'fs';
 import { join, relative, extname, basename, dirname } from 'path';
 import { homedir } from 'os';
 import { spawn } from 'child_process';
-import { askJev, jevConfigured, noul } from './jev.js';
+import { askJev, jevConfigured, jevInfo, noul } from './jev.js';
 
 const DEFAULT_VAULT_PATH =
   "/Users/<user>/Documents/Documents - My Mac (2)/Media /Marketing OS Broll/Marketing OS Broll";
@@ -209,6 +209,7 @@ export function getObsidianStatus() {
     videos: items.filter((i) => i.type === 'video').length,
     images: items.filter((i) => i.type === 'image').length,
     jev: jevConfigured(),
+    jevInfo: jevInfo(),
   };
 }
 

@@ -9,6 +9,26 @@ import { GoogleGenAI } from '@google/genai';
 import { fal } from '@fal-ai/client';
 import { queryVault as obsidianQueryVault, getItemById as obsidianGetItemById, thumbnailPathFor as obsidianThumbnailPathFor, getObsidianStatus, syncMirror as obsidianSyncMirror } from './obsidian-agent.js';
 import { askJev, jevConfigured, choice as jevChoice, noul as jevNoul } from './jev.js';
+import {
+  chatCompletion,
+  claudeCompat,
+  audioTranscription,
+  synthesizeSpeech,
+  listProviders,
+  getRuntimeProviders,
+  seedFromEnvNow,
+  createProvider,
+  updateProvider,
+  deleteProvider,
+  reorderProviders,
+  testProvider,
+  testAllProviders,
+  listLogs,
+  clearLogs,
+  addExternalLog,
+  poolStatus,
+  LLM_DB_PATH,
+} from './llm-pool.js';
 
 // Load environment variables from .dev.vars
 function loadEnvVars() {
@@ -35,36 +55,26 @@ if (process.env.FAL_API_KEY && !process.env.FAL_KEY) {
   process.env.FAL_KEY = process.env.FAL_API_KEY;
 }
 
-// Calls Claude Sonnet 5 directly over the Messages API. Used for the actual
-// chat/prompt orchestration in DiCaprio (prompt enhancement) and CreatorOS
-// (command planning) — Director's orchestration lives in the Cloudflare
-// Worker (src/worker/index.ts), which has its own copy of this helper.
-// Deeper multimodal helpers elsewhere in this file (video/transcript
-// analysis, animation JSX generation) still use Gemini intentionally.
-async function callClaude(apiKey, system, userMessage, maxTokens = 1024) {
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-5',
-      max_tokens: maxTokens,
-      system,
-      messages: [{ role: 'user', content: userMessage }],
-    }),
-  });
+// LLM calls (Director/DiCaprio/CreatorOS orchestration) now go through the
+// OpenAI-compatible fallback pool in scripts/llm-pool.js: an ordered list of
+// { base_url, api_key, model } entries stored in SQLite and managed from the
+// /settings/llm page. Anthropic is reached through its OpenAI SDK-compatible
+// endpoint (https://api.anthropic.com/v1). The legacy per-call env key is used
+// as an ad-hoc provider when the pool is empty, so existing .dev.vars setups
+// keep working. Deeper multimodal helpers elsewhere in this file
+// (video/transcript analysis, animation JSX generation) still use Gemini.
+async function callLLM(apiKey, system, userMessage, maxTokens = 1024) {
+  return claudeCompat(apiKey, system, userMessage, maxTokens);
+}
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Claude API error (${response.status}): ${errText}`);
+// True when the SQLite fallback pool has at least one enabled provider —
+// transcription/TTS branches use this to run even without a legacy env key.
+function poolHasProviders() {
+  try {
+    return poolStatus().enabled_count > 0;
+  } catch {
+    return false;
   }
-
-  // Sonnet 5 puts extended-thinking blocks first — find the actual text block, not content[0].
-  const data = await response.json();
-  return data.content?.find((block) => block.type === 'text')?.text ?? '';
 }
 
 const PORT = 3333;
@@ -2770,37 +2780,19 @@ async function transcribeVideo(videoPath, jobId) {
     const audioStats = await stat(audioPath);
     console.log(`\n[${jobId}] Audio extracted: ${(audioStats.size / 1024 / 1024).toFixed(1)} MB`);
 
-    // Check for OpenAI API key
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      throw new Error('OPENAI_API_KEY not configured in .dev.vars');
-    }
-
-    // Send to Whisper API
+    // Transcribe through the OpenAI-compatible fallback pool
     console.log(`[${jobId}] Sending to Whisper API...`);
     const audioBuffer = readFileSync(audioPath);
     const audioBlob = new Blob([audioBuffer], { type: 'audio/mp3' });
 
-    const formData = new FormData();
-    formData.append('file', audioBlob, 'audio.mp3');
-    formData.append('model', 'whisper-1');
-    formData.append('response_format', 'verbose_json');
-    formData.append('timestamp_granularities[]', 'word');
-
-    const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-      },
-      body: formData,
+    const result = await audioTranscription((model) => {
+      const formData = new FormData();
+      formData.append('file', audioBlob, 'audio.mp3');
+      formData.append('model', model);
+      formData.append('response_format', 'verbose_json');
+      formData.append('timestamp_granularities[]', 'word');
+      return formData;
     });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Whisper API error: ${response.status} - ${errorText}`);
-    }
-
-    const result = await response.json();
     console.log(`[${jobId}] Transcription complete: ${result.text?.length || 0} characters`);
 
     // Cleanup
@@ -3185,27 +3177,20 @@ async function getOrTranscribeVideo(session, videoAsset, jobId) {
       console.log(`[${jobId}] Falling back to Gemini...`);
       transcription = await transcribeWithGeminiLocal();
     }
-  } else if (openaiKey) {
-    console.log(`[${jobId}] Using OpenAI Whisper API...`);
+  } else if (openaiKey || poolHasProviders()) {
+    console.log(`[${jobId}] Using OpenAI-compatible Whisper API...`);
     const { FormData, File } = await import('formdata-node');
     const audioBuffer = readFileSync(audioPath);
-    const formData = new FormData();
-    formData.append('file', new File([audioBuffer], 'audio.mp3', { type: 'audio/mp3' }));
-    formData.append('model', 'whisper-1');
-    formData.append('response_format', 'verbose_json');
-    formData.append('timestamp_granularities[]', 'word');
 
-    const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${openaiKey}` },
-      body: formData,
+    const whisperResult = await audioTranscription((model) => {
+      const formData = new FormData();
+      formData.append('file', new File([audioBuffer], 'audio.mp3', { type: 'audio/mp3' }));
+      formData.append('model', model);
+      formData.append('response_format', 'verbose_json');
+      formData.append('timestamp_granularities[]', 'word');
+      return formData;
     });
 
-    if (!whisperResponse.ok) {
-      throw new Error(`Whisper API error: ${whisperResponse.status}`);
-    }
-
-    const whisperResult = await whisperResponse.json();
     transcription = {
       text: whisperResult.text || '',
       words: (whisperResult.words || []).map(w => ({
@@ -3338,7 +3323,7 @@ async function handleTranscribe(req, res, sessionId) {
     const openaiKey = process.env.OPENAI_API_KEY;
     const geminiKey = process.env.GEMINI_API_KEY;
 
-    if (!hasLocalWhisper && !openaiKey && !geminiKey) {
+    if (!hasLocalWhisper && !openaiKey && !poolHasProviders() && !geminiKey) {
       res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify({ error: 'No transcription method available. Install local Whisper (pip3 install openai-whisper) or set GEMINI_API_KEY in .dev.vars' }));
       return;
@@ -3353,8 +3338,8 @@ async function handleTranscribe(req, res, sessionId) {
 
     // Determine which method to use
     const useLocalWhisper = hasLocalWhisper;
-    const useOpenAIWhisper = !hasLocalWhisper && !!openaiKey;
-    const useGemini = !hasLocalWhisper && !openaiKey && !!geminiKey;
+    const useOpenAIWhisper = !hasLocalWhisper && (!!openaiKey || poolHasProviders());
+    const useGemini = !hasLocalWhisper && !useOpenAIWhisper && !!geminiKey;
 
     const method = useLocalWhisper ? 'Local Whisper' : useOpenAIWhisper ? 'OpenAI Whisper' : 'Gemini';
     console.log(`\n[${jobId}] === TRANSCRIBE FOR CAPTIONS (${method}) ===`);
@@ -3460,35 +3445,22 @@ async function handleTranscribe(req, res, sessionId) {
       }
 
     } else if (useOpenAIWhisper) {
-      // === OpenAI Whisper API - Accurate word-level timestamps ===
-      console.log(`[${jobId}] Sending to OpenAI Whisper for transcription...`);
+      // === OpenAI-compatible Whisper API - Accurate word-level timestamps ===
+      console.log(`[${jobId}] Sending to Whisper API for transcription...`);
       const audioBuffer = readFileSync(audioPath);
 
-      // Create FormData for multipart upload
+      // Create FormData for multipart upload (fresh per fallback attempt)
       const FormData = (await import('formdata-node')).FormData;
       const { Blob } = await import('buffer');
 
-      const formData = new FormData();
-      formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
-      formData.append('model', 'whisper-1');
-      formData.append('response_format', 'verbose_json');
-      formData.append('timestamp_granularities[]', 'word');
-
-      const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${openaiKey}`,
-        },
-        body: formData,
+      const whisperResult = await audioTranscription((model) => {
+        const formData = new FormData();
+        formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
+        formData.append('model', model);
+        formData.append('response_format', 'verbose_json');
+        formData.append('timestamp_granularities[]', 'word');
+        return formData;
       });
-
-      if (!whisperResponse.ok) {
-        const errorText = await whisperResponse.text();
-        console.error(`[${jobId}] Whisper API error:`, errorText);
-        throw new Error(`Whisper API error: ${whisperResponse.status} - ${errorText}`);
-      }
-
-      const whisperResult = await whisperResponse.json();
       console.log(`[${jobId}] Whisper transcription complete: ${whisperResult.words?.length || 0} words`);
 
       transcription = {
@@ -3946,29 +3918,20 @@ async function handleGenerateBroll(req, res, sessionId) {
           transcription = match ? JSON.parse(match[0]) : { text: respText, words: [] };
         }
       }
-    } else if (openaiKey) {
-      console.log(`[${jobId}]    Using OpenAI Whisper API...`);
+    } else if (openaiKey || poolHasProviders()) {
+      console.log(`[${jobId}]    Using OpenAI-compatible Whisper API...`);
       const audioBuffer = readFileSync(audioPath);
       const FormData = (await import('formdata-node')).FormData;
       const { Blob } = await import('buffer');
 
-      const formData = new FormData();
-      formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
-      formData.append('model', 'whisper-1');
-      formData.append('response_format', 'verbose_json');
-      formData.append('timestamp_granularities[]', 'word');
-
-      const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${openaiKey}` },
-        body: formData,
+      const whisperResult = await audioTranscription((model) => {
+        const formData = new FormData();
+        formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
+        formData.append('model', model);
+        formData.append('response_format', 'verbose_json');
+        formData.append('timestamp_granularities[]', 'word');
+        return formData;
       });
-
-      if (!whisperResponse.ok) {
-        throw new Error(`Whisper API error: ${whisperResponse.status}`);
-      }
-
-      const whisperResult = await whisperResponse.json();
       transcription = {
         text: whisperResult.text || '',
         words: (whisperResult.words || []).map(w => ({
@@ -5607,7 +5570,7 @@ Output: "Cinematic slow zoom in with subtle parallax movement, gentle ambient mo
 Input: "zoom out"
 Output: "Epic reveal shot with slow cinematic zoom out, camera gently pulling back to reveal the full scene, subtle atmospheric haze and soft light flares, smooth dolly movement with slight vertical lift"`;
 
-        const result = await callClaude(anthropicApiKey, systemPrompt, `Enhance this video motion prompt: "${prompt}"`, 800);
+        const result = await callLLM(anthropicApiKey, systemPrompt, `Enhance this video motion prompt: "${prompt}"`, 800);
         enhancedPrompt = result.trim();
         console.log(`[${jobId}] Enhanced prompt: ${enhancedPrompt.substring(0, 100)}...`);
       } catch (e) {
@@ -5804,7 +5767,7 @@ async function handleRestyleVideo(req, res, sessionId) {
       try {
         console.log(`[${jobId}] Enhancing style prompt with AI...`);
 
-        const result = await callClaude(
+        const result = await callLLM(
           anthropicApiKey,
           'You are an expert at writing prompts for AI video style transfer. Transform the user\'s simple style request into a detailed, cinematic prompt that will produce stunning results. Include color grading and mood, texture and grain quality, lighting style, overall aesthetic, and any specific visual effects. Return ONLY the enhanced prompt, no explanations.',
           `User request: "${prompt}"`,
@@ -6587,26 +6550,20 @@ async function handleAnalyzeForAnimation(req, res, sessionId) {
         console.log(`[${jobId}]    Falling back to Gemini...`);
         transcription = await transcribeWithGemini();
       }
-    } else if (openaiKey) {
-      console.log(`[${jobId}]    Using OpenAI Whisper API...`);
-      const FormData = (await import('node-fetch')).default.FormData || global.FormData;
-      const formData = new FormData();
-      formData.append('file', createReadStream(audioPath));
-      formData.append('model', 'whisper-1');
-      formData.append('response_format', 'verbose_json');
-      formData.append('timestamp_granularities[]', 'word');
+    } else if (openaiKey || poolHasProviders()) {
+      console.log(`[${jobId}]    Using OpenAI-compatible Whisper API...`);
+      const audioBuffer = readFileSync(audioPath);
+      const FormData = (await import('formdata-node')).FormData;
+      const { Blob } = await import('buffer');
 
-      const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${openaiKey}` },
-        body: formData,
+      const whisperResult = await audioTranscription((model) => {
+        const formData = new FormData();
+        formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
+        formData.append('model', model);
+        formData.append('response_format', 'verbose_json');
+        formData.append('timestamp_granularities[]', 'word');
+        return formData;
       });
-
-      if (!whisperResponse.ok) {
-        throw new Error(`Whisper API error: ${whisperResponse.status}`);
-      }
-
-      const whisperResult = await whisperResponse.json();
       transcription = {
         text: whisperResult.text || '',
         words: (whisperResult.words || []).map(w => ({
@@ -7094,29 +7051,20 @@ async function handleGenerateTranscriptAnimation(req, res, sessionId) {
         console.log(`[${jobId}]    Falling back to Gemini...`);
         transcription = await transcribeWithGeminiForAnimation();
       }
-    } else if (openaiKey) {
-      console.log(`[${jobId}]    Using OpenAI Whisper API...`);
+    } else if (openaiKey || poolHasProviders()) {
+      console.log(`[${jobId}]    Using OpenAI-compatible Whisper API...`);
       const audioBuffer = readFileSync(audioPath);
       const FormData = (await import('formdata-node')).FormData;
       const { Blob } = await import('buffer');
 
-      const formData = new FormData();
-      formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
-      formData.append('model', 'whisper-1');
-      formData.append('response_format', 'verbose_json');
-      formData.append('timestamp_granularities[]', 'word');
-
-      const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${openaiKey}` },
-        body: formData,
+      const whisperResult = await audioTranscription((model) => {
+        const formData = new FormData();
+        formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
+        formData.append('model', model);
+        formData.append('response_format', 'verbose_json');
+        formData.append('timestamp_granularities[]', 'word');
+        return formData;
       });
-
-      if (!whisperResponse.ok) {
-        throw new Error(`Whisper API error: ${whisperResponse.status}`);
-      }
-
-      const whisperResult = await whisperResponse.json();
       transcription = {
         text: whisperResult.text || '',
         words: (whisperResult.words || []).map(w => ({
@@ -7460,26 +7408,20 @@ async function handleGenerateContextualAnimation(req, res, sessionId) {
         console.log(`[${jobId}]    Falling back to Gemini...`);
         transcription = await transcribeWithGeminiContextual();
       }
-    } else if (openaiKey) {
-      console.log(`[${jobId}]    Using OpenAI Whisper API...`);
-      const FormData = (await import('node-fetch')).default.FormData || global.FormData;
-      const formData = new FormData();
-      formData.append('file', createReadStream(audioPath));
-      formData.append('model', 'whisper-1');
-      formData.append('response_format', 'verbose_json');
-      formData.append('timestamp_granularities[]', 'word');
+    } else if (openaiKey || poolHasProviders()) {
+      console.log(`[${jobId}]    Using OpenAI-compatible Whisper API...`);
+      const audioBuffer = readFileSync(audioPath);
+      const FormData = (await import('formdata-node')).FormData;
+      const { Blob } = await import('buffer');
 
-      const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${openaiKey}` },
-        body: formData,
+      const whisperResult = await audioTranscription((model) => {
+        const formData = new FormData();
+        formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
+        formData.append('model', model);
+        formData.append('response_format', 'verbose_json');
+        formData.append('timestamp_granularities[]', 'word');
+        return formData;
       });
-
-      if (!whisperResponse.ok) {
-        throw new Error(`Whisper API error: ${whisperResponse.status}`);
-      }
-
-      const whisperResult = await whisperResponse.json();
       transcription = {
         text: whisperResult.text || '',
         words: (whisperResult.words || []).map(w => ({
@@ -8340,7 +8282,8 @@ async function handleDirectorRoute(req, res) {
 }
 
 // POST /director/tts   Body: { text, voice? }  → audio/mpeg
-// OpenAI TTS; the client falls back to browser speechSynthesis on any non-200.
+// OpenAI-compatible TTS through the fallback pool; the client falls back to
+// browser speechSynthesis on any non-200.
 async function handleDirectorTts(req, res) {
   try {
     const { text, voice, instructions } = await parseBody(req);
@@ -8349,38 +8292,166 @@ async function handleDirectorTts(req, res) {
       res.end(JSON.stringify({ error: 'text is required' }));
       return;
     }
-    const apiKey = process.env.OPENAI_API_KEY?.trim();
-    if (!apiKey) {
-      res.writeHead(503, JSON_CORS);
-      res.end(JSON.stringify({ error: 'tts-not-configured' }));
-      return;
-    }
-    const r = await fetch('https://api.openai.com/v1/audio/speech', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        // gpt-4o-mini-tts follows delivery instructions (accent, age, tone); tts-1 ignores them.
-        model: instructions ? (process.env.DIRECTOR_TTS_INSTRUCTED_MODEL || 'gpt-4o-mini-tts') : (process.env.DIRECTOR_TTS_MODEL || 'tts-1'),
-        voice: voice || process.env.DIRECTOR_TTS_VOICE || 'onyx',
-        input: text.slice(0, 1200),
-        ...(instructions ? { instructions: String(instructions).slice(0, 600) } : {}),
-        response_format: 'mp3',
-      }),
-    });
-    if (!r.ok) {
-      const err = await r.text().catch(() => '');
-      console.error('[Director] TTS error:', r.status, err.slice(0, 200));
+    try {
+      const { buffer, provider, model } = await synthesizeSpeech({ input: text, voice, instructions });
+      console.log(`[Director] TTS via ${provider} (${model}, ${buffer.length} bytes)`);
+      res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': buffer.length, 'Access-Control-Allow-Origin': '*' });
+      res.end(buffer);
+    } catch (error) {
+      if (error.code === 'tts-not-configured') {
+        res.writeHead(503, JSON_CORS);
+        res.end(JSON.stringify({ error: 'tts-not-configured' }));
+        return;
+      }
+      console.error('[Director] TTS error:', error.message);
       res.writeHead(502, JSON_CORS);
-      res.end(JSON.stringify({ error: `tts ${r.status}` }));
-      return;
+      res.end(JSON.stringify({ error: `tts failed: ${error.message}` }));
     }
-    const buf = Buffer.from(await r.arrayBuffer());
-    res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': buf.length, 'Access-Control-Allow-Origin': '*' });
-    res.end(buf);
   } catch (error) {
     console.error('[Director] TTS error:', error.message);
     res.writeHead(500, JSON_CORS);
     res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ============== LLM FALLBACK POOL (management API for /settings/llm) ==============
+
+function sendJson(res, status, payload) {
+  res.writeHead(status, JSON_CORS);
+  res.end(JSON.stringify(payload));
+}
+
+function handleLlmStatus(req, res) {
+  try {
+    const status = poolStatus();
+    status.db_path = LLM_DB_PATH;
+    sendJson(res, 200, status);
+  } catch (error) {
+    sendJson(res, 500, { error: error.message });
+  }
+}
+
+// Full config including keys — used by the local Cloudflare Worker bridge.
+// Loopback-only: raw API keys must never leave the machine.
+function handleLlmRuntime(req, res) {
+  const remote = (req.socket.remoteAddress || '').replace('::ffff:', '');
+  if (remote !== '127.0.0.1' && remote !== '::1') {
+    sendJson(res, 403, { error: 'loopback access required' });
+    return;
+  }
+  try {
+    sendJson(res, 200, { providers: getRuntimeProviders('chat'), db_path: LLM_DB_PATH });
+  } catch (error) {
+    sendJson(res, 500, { error: error.message });
+  }
+}
+
+function handleLlmProviderList(req, res) {
+  try {
+    sendJson(res, 200, { providers: listProviders(), status: poolStatus() });
+  } catch (error) {
+    sendJson(res, 500, { error: error.message });
+  }
+}
+
+async function handleLlmSeedFromEnv(req, res) {
+  try {
+    const result = seedFromEnvNow();
+    console.log(`[llm-pool] Seed from .dev.vars: ${result.added} provider ditambahkan`);
+    sendJson(res, 200, { ...result, providers: listProviders() });
+  } catch (error) {
+    sendJson(res, 400, { error: error.message });
+  }
+}
+
+async function handleLlmProviderCreate(req, res) {
+  try {
+    const body = await parseBody(req);
+    const provider = createProvider(body);
+    console.log(`[llm-pool] Provider added: ${provider.name} (${provider.base_url} · ${provider.model})`);
+    sendJson(res, 201, { provider });
+  } catch (error) {
+    sendJson(res, 400, { error: error.message });
+  }
+}
+
+async function handleLlmProviderUpdate(req, res, id) {
+  try {
+    const body = await parseBody(req);
+    const provider = updateProvider(id, body);
+    console.log(`[llm-pool] Provider updated: #${id} ${provider.name}`);
+    sendJson(res, 200, { provider });
+  } catch (error) {
+    sendJson(res, 400, { error: error.message });
+  }
+}
+
+function handleLlmProviderDelete(req, res, id) {
+  try {
+    deleteProvider(id);
+    console.log(`[llm-pool] Provider deleted: #${id}`);
+    sendJson(res, 200, { deleted: id });
+  } catch (error) {
+    sendJson(res, 400, { error: error.message });
+  }
+}
+
+async function handleLlmProviderTest(req, res, id) {
+  try {
+    const body = await parseBody(req).catch(() => ({}));
+    const result = await testProvider(id, body.capability || 'chat');
+    sendJson(res, 200, result);
+  } catch (error) {
+    sendJson(res, 400, { ok: false, error: error.message });
+  }
+}
+
+async function handleLlmTestAll(req, res) {
+  try {
+    const body = await parseBody(req).catch(() => ({}));
+    const results = await testAllProviders(body.capability || 'chat');
+    sendJson(res, 200, { results });
+  } catch (error) {
+    sendJson(res, 500, { error: error.message });
+  }
+}
+
+async function handleLlmReorder(req, res) {
+  try {
+    const body = await parseBody(req);
+    const providers = reorderProviders(body.ids);
+    sendJson(res, 200, { providers });
+  } catch (error) {
+    sendJson(res, 400, { error: error.message });
+  }
+}
+
+// Best-effort logging from the Cloudflare Worker bridge (source: 'worker').
+async function handleLlmLogAppend(req, res) {
+  try {
+    const body = await parseBody(req);
+    const entries = Array.isArray(body) ? body : [body];
+    for (const entry of entries) addExternalLog(entry);
+    sendJson(res, 200, { ok: true, count: entries.length });
+  } catch (error) {
+    sendJson(res, 400, { error: error.message });
+  }
+}
+
+function handleLlmLogs(req, res, url) {
+  try {
+    const limit = url.searchParams.get('limit') || 100;
+    sendJson(res, 200, { logs: listLogs(limit) });
+  } catch (error) {
+    sendJson(res, 500, { error: error.message });
+  }
+}
+
+function handleLlmLogsClear(req, res) {
+  try {
+    sendJson(res, 200, clearLogs());
+  } catch (error) {
+    sendJson(res, 500, { error: error.message });
   }
 }
 
@@ -8644,7 +8715,7 @@ Return ONLY a JSON object, no markdown fences, no commentary:
 
 If the request is ambiguous, unsafe, or the timeline is empty when a render is needed, return { "steps": [], "message": "<question or explanation for the user>" }.`;
 
-  const raw = (await callClaude(anthropicApiKey, systemPrompt, prompt, 2048)).trim() || '{}';
+  const raw = (await callLLM(anthropicApiKey, systemPrompt, prompt, 2048)).trim() || '{}';
   let plan;
   try {
     plan = JSON.parse(raw);
@@ -8913,7 +8984,7 @@ Return ONLY a JSON object, no prose, no markdown fences:
 {"contentType":"...","pacing":"...","candidates":[{"start":12.3,"end":41.8,"score":88,"title":"3-6 word label","hook":"...","reason":"one sentence"}]}
 Timestamps must be taken from the transcript line prefixes. Total video duration is ${totalDuration.toFixed(1)} seconds.`;
 
-  const text = await callClaude(apiKey, system, `TRANSCRIPT:\n${transcriptLines}`, 6000);
+  const text = await callLLM(apiKey, system, `TRANSCRIPT:\n${transcriptLines}`, 6000);
   let parsed;
   try {
     parsed = JSON.parse(text);
@@ -9207,6 +9278,64 @@ const server = http.createServer(async (req, res) => {
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const path = url.pathname;
+
+  // LLM fallback pool management (settings page + Cloudflare Worker bridge)
+  if (path === '/llm/status' && req.method === 'GET') {
+    handleLlmStatus(req, res);
+    return;
+  }
+  if (path === '/llm/providers/runtime' && req.method === 'GET') {
+    handleLlmRuntime(req, res);
+    return;
+  }
+  if (path === '/llm/providers' && req.method === 'GET') {
+    handleLlmProviderList(req, res);
+    return;
+  }
+  if (path === '/llm/providers' && req.method === 'POST') {
+    await handleLlmProviderCreate(req, res);
+    return;
+  }
+  if (path === '/llm/providers/reorder' && req.method === 'POST') {
+    await handleLlmReorder(req, res);
+    return;
+  }
+  if (path === '/llm/providers/seed' && req.method === 'POST') {
+    await handleLlmSeedFromEnv(req, res);
+    return;
+  }
+  if (path === '/llm/test' && req.method === 'POST') {
+    await handleLlmTestAll(req, res);
+    return;
+  }
+  if (path === '/llm/logs' && req.method === 'GET') {
+    handleLlmLogs(req, res, url);
+    return;
+  }
+  if (path === '/llm/logs' && req.method === 'POST') {
+    await handleLlmLogAppend(req, res);
+    return;
+  }
+  if (path === '/llm/logs' && req.method === 'DELETE') {
+    handleLlmLogsClear(req, res);
+    return;
+  }
+  const llmProviderMatch = path.match(/^\/llm\/providers\/(\d+)(\/test)?$/);
+  if (llmProviderMatch) {
+    const providerId = Number(llmProviderMatch[1]);
+    if (llmProviderMatch[2] === '/test' && req.method === 'POST') {
+      await handleLlmProviderTest(req, res, providerId);
+      return;
+    }
+    if (req.method === 'PUT') {
+      await handleLlmProviderUpdate(req, res, providerId);
+      return;
+    }
+    if (req.method === 'DELETE') {
+      handleLlmProviderDelete(req, res, providerId);
+      return;
+    }
+  }
 
   // Session-based routes (new efficient API)
   const sessionMatch = path.match(/^\/session\/([^/]+)(\/(.+))?$/);

@@ -11,7 +11,9 @@ interface TimelineProps {
   currentTime: number;
   duration: number;
   isPlaying: boolean;
-  aspectRatio: '16:9' | '9:16';
+  aspectRatio: string;
+  videoWidth: number;
+  videoHeight: number;
   onSelectClip: (id: string | null) => void;
   onTimeChange: (time: number) => void;
   onPlayPause: () => void;
@@ -50,6 +52,8 @@ export default function Timeline({
   duration,
   isPlaying,
   aspectRatio,
+  videoWidth,
+  videoHeight,
   onSelectClip,
   onTimeChange,
   onPlayPause,
@@ -279,12 +283,12 @@ export default function Timeline({
             <button
               onClick={onToggleAspectRatio}
               className="p-1.5 bg-zinc-700 hover:bg-zinc-600 rounded transition-colors"
-              title={`Currently ${aspectRatio === '16:9' ? '16:9 (horizontal)' : '9:16 (vertical)'} - click to switch`}
+              title={`Rasio video: ${aspectRatio} (${videoWidth}×${videoHeight}) — klik untuk ubah`}
             >
-              {aspectRatio === '16:9' ? (
-                <RectangleHorizontal className="w-3.5 h-3.5" />
-              ) : (
+              {videoHeight > videoWidth ? (
                 <RectangleVertical className="w-3.5 h-3.5" />
+              ) : (
+                <RectangleHorizontal className="w-3.5 h-3.5" />
               )}
             </button>
             <div className="w-px h-4 bg-zinc-600" />

@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
+import { Link } from 'react-router';
 import VideoPreview, { VideoPreviewHandle } from '@/react-app/components/VideoPreview';
 import Timeline from '@/react-app/components/Timeline';
 import AssetLibrary from '@/react-app/components/AssetLibrary';
@@ -13,9 +14,11 @@ import GifSearchPanel from '@/react-app/components/GifSearchPanel';
 import ResizablePanel from '@/react-app/components/ResizablePanel';
 import ResizableVerticalPanel from '@/react-app/components/ResizableVerticalPanel';
 import TimelineTabs from '@/react-app/components/TimelineTabs';
+import AspectRatioPicker from '@/react-app/components/AspectRatioPicker';
+import { formatSizeLabel, normalizeDimension } from '@/react-app/lib/videoFormats';
 import { useProject, Asset, TimelineClip, CaptionStyle } from '@/react-app/hooks/useProject';
 import { useVideoSession } from '@/react-app/hooks/useVideoSession';
-import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Film, Rocket, Scissors, Database } from 'lucide-react';
+import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Film, Rocket, Scissors, Database, Settings } from 'lucide-react';
 import type { TemplateId } from '@/remotion/templates';
 import { SIZE_TO_SCALE, POSITION_TO_OFFSET, formatTime, type DirectorTimelineOp, type VaultPlacement, type TrackId } from '@/react-app/lib/directorOps';
 
@@ -34,7 +37,8 @@ export default function Home() {
   const [showChapters, setShowChapters] = useState(false);
   const [copied, setCopied] = useState(false);
   const [previewAssetId, setPreviewAssetId] = useState<string | null>(null);
-  const [aspectRatio, setAspectRatio] = useState<'16:9' | '9:16'>('16:9');
+  const [aspectRatio, setAspectRatio] = useState<string>('16:9');
+  const [showRatioPicker, setShowRatioPicker] = useState(false);
   const [autoSnap, setAutoSnap] = useState(true); // Ripple delete mode - shift clips when deleting
   const [activeAgent, setActiveAgent] = useState<'director' | 'obsidian' | 'dicaprio' | 'creatoros' | 'shorts'>('director');
   const [showGifSearch, setShowGifSearch] = useState(false);
@@ -79,8 +83,15 @@ export default function Home() {
     updateTabClips,
     updateTabAsset,
     // Settings
+    settings,
     setSettings,
   } = useProject();
+
+  // Label rasio selalu diturunkan dari settings.width/height (sumber kebenaran
+  // preview & ekspor), termasuk dimensi custom di luar preset.
+  useEffect(() => {
+    setAspectRatio(formatSizeLabel(settings.width, settings.height));
+  }, [settings.width, settings.height]);
 
   // Compute the active clips based on which tab is selected
   const activeClips = useMemo(() => {
@@ -297,18 +308,22 @@ export default function Home() {
       try {
         const newAsset = await uploadAsset(file);
 
-        // Auto-detect aspect ratio from video dimensions
-        if (newAsset && newAsset.type === 'video' && newAsset.width && newAsset.height) {
-          const isPortrait = newAsset.height > newAsset.width;
-          setAspectRatio(isPortrait ? '9:16' : '16:9');
-          console.log(`Auto-detected aspect ratio: ${isPortrait ? '9:16 (portrait)' : '16:9 (landscape)'} from ${newAsset.width}x${newAsset.height}`);
+        // Auto-detect format dari video pertama: saat timeline masih kosong,
+        // kanvas (preview + ekspor) mengikuti dimensi video yang diunggah.
+        if (newAsset && newAsset.type === 'video' && newAsset.width && newAsset.height && clips.length === 0) {
+          setSettings(s => ({
+            ...s,
+            width: normalizeDimension(newAsset.width!),
+            height: normalizeDimension(newAsset.height!),
+          }));
+          console.log(`Auto-detected video format: ${newAsset.width}x${newAsset.height}`);
         }
       } catch (error) {
         console.error('Upload failed:', error);
         alert(`Upload failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       }
     }
-  }, [uploadAsset]);
+  }, [uploadAsset, clips.length, setSettings]);
 
   // Handle GIF added from search panel
   const handleGifAdded = useCallback(async () => {
@@ -477,19 +492,18 @@ export default function Home() {
     console.log('Add text overlay at', currentTime);
   }, [currentTime]);
 
-  // Handle toggling aspect ratio
-  const handleToggleAspectRatio = useCallback(() => {
-    setAspectRatio(prev => {
-      const newRatio = prev === '16:9' ? '9:16' : '16:9';
-      // Update project settings with new dimensions
-      if (newRatio === '9:16') {
-        setSettings(s => ({ ...s, width: 1080, height: 1920 }));
-      } else {
-        setSettings(s => ({ ...s, width: 1920, height: 1080 }));
-      }
-      return newRatio;
-    });
-  }, [setSettings]);
+  // Buka dialog rasio video (preset + custom piksel)
+  const handleOpenRatioPicker = useCallback(() => {
+    setShowRatioPicker(true);
+  }, []);
+
+  // Terapkan format dari AspectRatioPicker — mengubah kanvas preview sekaligus
+  // dimensi ekspor, lalu simpan proyek.
+  const handleApplyVideoFormat = useCallback((width: number, height: number) => {
+    setSettings(s => ({ ...s, width, height }));
+    setShowRatioPicker(false);
+    setTimeout(() => saveProject(), 100);
+  }, [setSettings, saveProject]);
 
   // Shorts generator: drop a finished short onto V1 at the end of the main
   // timeline, flipping the canvas to match its aspect ratio if needed.
@@ -498,10 +512,12 @@ export default function Home() {
     if (!asset) return;
     if (activeTabId !== 'main') switchTimelineTab('main');
 
-    const isPortrait = (asset.height ?? 0) > (asset.width ?? 0);
     if (asset.width && asset.height) {
-      setSettings(s => ({ ...s, width: asset.width!, height: asset.height! }));
-      setAspectRatio(isPortrait ? '9:16' : '16:9');
+      setSettings(s => ({
+        ...s,
+        width: normalizeDimension(asset.width!),
+        height: normalizeDimension(asset.height!),
+      }));
     }
 
     const v1End = clips
@@ -1121,9 +1137,9 @@ export default function Home() {
           templateId: config.templateId,
           props: config.props,
           duration: config.duration,
-          fps: 30,
-          width: 1920,
-          height: 1080,
+          fps: settings.fps,
+          width: settings.width,
+          height: settings.height,
         }),
       });
 
@@ -1150,7 +1166,7 @@ export default function Home() {
       console.error('Failed to add motion graphic:', error);
       throw error; // Re-throw so AIPromptPanel can show error
     }
-  }, [session, currentTime, addClip, saveProject, refreshAssets, switchTimelineTab]);
+  }, [session, currentTime, addClip, saveProject, refreshAssets, switchTimelineTab, settings.width, settings.height, settings.fps]);
 
   // Handle custom AI-generated animation creation
   const handleCreateCustomAnimation = useCallback(async (description: string, startTime?: number, endTime?: number, attachedAssetIds?: string[], durationSeconds?: number) => {
@@ -1191,9 +1207,9 @@ export default function Home() {
           endTime,      // Optional: specific time range
           attachedAssetIds, // Optional: images/videos to include in animation
           durationSeconds, // Optional: user-specified duration
-          fps: 30,
-          width: 1920,
-          height: 1080,
+          fps: settings.fps,
+          width: settings.width,
+          height: settings.height,
         }),
       });
 
@@ -1252,7 +1268,7 @@ export default function Home() {
       console.error('Failed to create custom animation:', error);
       throw error;
     }
-  }, [session, currentTime, addClip, saveProject, refreshAssets, getDuration, switchTimelineTab, clips, assets]);
+  }, [session, currentTime, addClip, saveProject, refreshAssets, getDuration, switchTimelineTab, clips, assets, settings.width, settings.height, settings.fps]);
 
   // Handle analyzing video for animation (returns concept for approval)
   const handleAnalyzeForAnimation = useCallback(async (request: {
@@ -1317,9 +1333,9 @@ export default function Home() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         concept,
-        fps: 30,
-        width: 1920,
-        height: 1080,
+        fps: settings.fps,
+        width: settings.width,
+        height: settings.height,
       }),
     });
 
@@ -1367,7 +1383,7 @@ export default function Home() {
       assetId: data.assetId,
       duration: data.duration,
     };
-  }, [session, currentTime, refreshAssets, addClip, saveProject, getDuration, switchTimelineTab]);
+  }, [session, currentTime, refreshAssets, addClip, saveProject, getDuration, switchTimelineTab, settings.width, settings.height, settings.fps]);
 
   // Handle generating transcript animation (kinetic typography from speech)
   const handleGenerateTranscriptAnimation = useCallback(async () => {
@@ -1379,9 +1395,9 @@ export default function Home() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        fps: 30,
-        width: 1920,
-        height: 1080,
+        fps: settings.fps,
+        width: settings.width,
+        height: settings.height,
       }),
     });
 
@@ -1406,7 +1422,7 @@ export default function Home() {
       assetId: data.assetId,
       duration: data.duration,
     };
-  }, [session, currentTime, refreshAssets, addClip, saveProject]);
+  }, [session, currentTime, refreshAssets, addClip, saveProject, settings.width, settings.height, settings.fps]);
 
   // Handle batch animation generation (multiple animations across the video)
   const handleGenerateBatchAnimations = useCallback(async (count: number) => {
@@ -1419,9 +1435,9 @@ export default function Home() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         count,
-        fps: 30,
-        width: 1920,
-        height: 1080,
+        fps: settings.fps,
+        width: settings.width,
+        height: settings.height,
       }),
     });
 
@@ -1448,7 +1464,7 @@ export default function Home() {
       animations: data.animations,
       videoDuration: data.videoDuration,
     };
-  }, [session, refreshAssets, addClip, saveProject]);
+  }, [session, refreshAssets, addClip, saveProject, settings.width, settings.height, settings.fps]);
 
   // Handle extract audio (separates audio to A1 track, replaces video with muted version)
   const handleExtractAudio = useCallback(async () => {
@@ -1532,9 +1548,9 @@ export default function Home() {
           assetId: videoAsset.id,
           type: request.type,
           description: request.description,
-          fps: 30,
-          width: 1920,
-          height: 1080,
+          fps: settings.fps,
+          width: settings.width,
+          height: settings.height,
         }),
       });
 
@@ -1566,7 +1582,7 @@ export default function Home() {
       console.error('Failed to create contextual animation:', error);
       throw error;
     }
-  }, [session, assets, addClip, saveProject, getDuration, refreshAssets]);
+  }, [session, assets, addClip, saveProject, getDuration, refreshAssets, settings.width, settings.height, settings.fps]);
 
   // Handle render/export
   const handleExport = useCallback(async () => {
@@ -1619,9 +1635,9 @@ export default function Home() {
         editPrompt,
         assets: availableAssets,
         v1Context, // Pass V1 clip context for hybrid approach
-        fps: 30,
-        width: 1920,
-        height: 1080,
+        fps: settings.fps,
+        width: settings.width,
+        height: settings.height,
       }),
     });
 
@@ -1669,7 +1685,7 @@ export default function Home() {
       sceneCount: data.sceneCount,
       editCount: data.editCount,
     };
-  }, [session, assets, refreshAssets, updateTabAsset]);
+  }, [session, assets, refreshAssets, updateTabAsset, settings.width, settings.height, settings.fps]);
 
   // Open an animation in a new timeline tab for isolated editing
   const handleOpenAnimationInTab = useCallback((assetId: string, animationName: string) => {
@@ -1944,6 +1960,14 @@ export default function Home() {
               )}
             </>
           )}
+          <Link
+            to="/settings/llm"
+            title="Fallback LLM"
+            className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
+          >
+            <Settings className="w-4 h-4" />
+            Fallback LLM
+          </Link>
           <button className="px-4 py-2 bg-gradient-to-r from-zinc-500 to-zinc-500 hover:from-zinc-600 hover:to-zinc-600 rounded-lg text-sm font-medium transition-all">
             AI Edit
           </button>
@@ -2098,14 +2122,18 @@ export default function Home() {
                 ref={videoPreviewRef}
                 layers={previewLayers}
                 isPlaying={isPlaying && !previewAssetId}
-                aspectRatio={aspectRatio}
+                videoWidth={settings.width}
+                videoHeight={settings.height}
                 onLayerMove={handleLayerMove}
                 onLayerSelect={handleLayerSelect}
                 selectedLayerId={selectedClipId}
               />
             ) : clips.length > 0 ? (
               // Assets exist but playhead is not over any clip
-              <div className={`relative ${aspectRatio === '9:16' ? 'h-full max-h-full w-auto aspect-[9/16]' : 'h-full max-h-full w-auto aspect-video'} bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10 flex items-center justify-center`}>
+              <div
+                className="relative h-full max-h-full w-auto bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10 flex items-center justify-center"
+                style={{ aspectRatio: `${settings.width} / ${settings.height}` }}
+              >
                 <div className="text-center text-zinc-600">
                   <div className="text-sm">No clip at playhead</div>
                   <div className="text-xs mt-1">Move playhead over a clip to preview</div>
@@ -2141,6 +2169,8 @@ export default function Home() {
               duration={duration}
               isPlaying={isPlaying}
               aspectRatio={aspectRatio}
+              videoWidth={settings.width}
+              videoHeight={settings.height}
               onSelectClip={handleSelectClip}
               onTimeChange={handleTimelineSeek}
               onPlayPause={handlePlayPause}
@@ -2150,7 +2180,7 @@ export default function Home() {
               onDeleteClip={handleDeleteClip}
               onCutAtPlayhead={handleCutAtPlayhead}
               onAddText={handleAddText}
-              onToggleAspectRatio={handleToggleAspectRatio}
+              onToggleAspectRatio={handleOpenRatioPicker}
               autoSnap={autoSnap}
               onToggleAutoSnap={() => setAutoSnap(prev => !prev)}
               onDropAsset={handleDropAsset}
@@ -2301,6 +2331,15 @@ export default function Home() {
           onGifAdded={handleGifAdded}
         />
       )}
+
+      {/* Rasio / ukuran piksel video */}
+      <AspectRatioPicker
+        open={showRatioPicker}
+        width={settings.width}
+        height={settings.height}
+        onClose={() => setShowRatioPicker(false)}
+        onApply={handleApplyVideoFormat}
+      />
     </div>
   );
 }

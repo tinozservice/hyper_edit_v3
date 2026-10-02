@@ -2,12 +2,36 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 
 interface Env {
-  ANTHROPIC_API_KEY: string;
+  ANTHROPIC_API_KEY?: string;
+  ANTHROPIC_BASE_URL?: string;
+  ANTHROPIC_MODEL?: string;
+  OPENAI_API_KEY?: string;
+  OPENAI_BASE_URL?: string;
+  OPENAI_CHAT_MODEL?: string;
+  /** JSON array of { name, base_url, api_key, model, timeout_ms?, max_retries? } */
+  LLM_FALLBACKS?: string;
+  /** Local editor server that owns the SQLite fallback pool (default http://localhost:3333). */
+  LLM_BRIDGE_URL?: string;
   R2_BUCKET: R2Bucket;
   DB: D1Database;
+  ASSETS: Fetcher;
   MOCHA_USERS_SERVICE_API_URL: string;
   MOCHA_USERS_SERVICE_API_KEY: string;
 }
+
+interface LlmProvider {
+  id?: number | null;
+  name: string;
+  base_url: string;
+  api_key: string;
+  model: string;
+  timeout_ms?: number;
+  max_retries?: number;
+}
+
+type ChatContent = string | Array<string | { text?: string }>;
+
+const LLM_REQUEST_MAX_TOKENS = 1500;
 
 const FFMPEG_SYSTEM_PROMPT = `You are a video editing AI assistant that helps users edit their videos using FFmpeg commands.
 
@@ -43,32 +67,205 @@ Common video editing tasks:
 
 Always use -y flag to overwrite output. Provide safe, valid FFmpeg commands.`;
 
-// Calls Claude Sonnet 5 directly over the Messages API (works in the Workers
-// runtime without an SDK — the Anthropic Node SDK isn't guaranteed edge-safe).
-async function callClaude(apiKey: string, system: string, userMessage: string): Promise<string> {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+// LLM orchestration for the Director's prompt→FFmpeg engine. All providers are
+// OpenAI-compatible ({ base_url, api_key, model }) and tried in order:
+//   1. the SQLite fallback pool managed at /settings/llm, reached through the
+//      local editor server (http://localhost:3333/llm/providers/runtime)
+//   2. env.LLM_FALLBACKS (JSON array)
+//   3. legacy ANTHROPIC_API_KEY / OPENAI_API_KEY from .dev.vars
+// Anthropic is reached through its OpenAI SDK-compatible endpoint, so no
+// native Anthropic SDK is needed in the Workers runtime.
+const PROVIDER_CACHE_MS = 10_000;
+let providerCache: { at: number; providers: LlmProvider[]; bridgeUrl: string } | null = null;
+
+function bridgeUrlFor(env: Env): string {
+  return (env.LLM_BRIDGE_URL || "http://localhost:3333").replace(/\/+$/, "");
+}
+
+function envProviders(env: Env): LlmProvider[] {
+  if (env.LLM_FALLBACKS) {
+    try {
+      const parsed = JSON.parse(env.LLM_FALLBACKS);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .filter((p) => p && p.base_url && p.api_key && p.model)
+          .map((p) => ({
+            name: String(p.name || p.base_url),
+            base_url: String(p.base_url).replace(/\/+$/, ""),
+            api_key: String(p.api_key),
+            model: String(p.model),
+            timeout_ms: Number(p.timeout_ms) || 30_000,
+            max_retries: Number(p.max_retries) || 0,
+          }));
+      }
+    } catch (error) {
+      console.error("LLM_FALLBACKS is not valid JSON:", error);
+    }
+  }
+
+  const providers: LlmProvider[] = [];
+  if (env.ANTHROPIC_API_KEY) {
+    providers.push({
+      name: "Anthropic (OpenAI-compatible)",
+      base_url: (env.ANTHROPIC_BASE_URL || "https://api.anthropic.com/v1").replace(/\/+$/, ""),
+      api_key: env.ANTHROPIC_API_KEY,
+      model: env.ANTHROPIC_MODEL || "claude-sonnet-5",
+      timeout_ms: 30_000,
+      max_retries: 1,
+    });
+  }
+  if (env.OPENAI_API_KEY) {
+    providers.push({
+      name: "OpenAI",
+      base_url: (env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, ""),
+      api_key: env.OPENAI_API_KEY,
+      model: env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
+      timeout_ms: 30_000,
+      max_retries: 1,
+    });
+  }
+  return providers;
+}
+
+async function loadProviders(env: Env): Promise<{ providers: LlmProvider[]; bridgeUrl: string }> {
+  const bridgeUrl = bridgeUrlFor(env);
+  const now = Date.now();
+  if (providerCache && now - providerCache.at < PROVIDER_CACHE_MS) {
+    return { providers: providerCache.providers, bridgeUrl: providerCache.bridgeUrl };
+  }
+  try {
+    const res = await fetch(`${bridgeUrl}/llm/providers/runtime`, { signal: AbortSignal.timeout(1500) });
+    if (res.ok) {
+      const data = (await res.json()) as { providers?: LlmProvider[] };
+      const list = (data.providers || []).filter((p) => p.base_url && p.api_key && p.model);
+      if (list.length) {
+        providerCache = { at: now, providers: list, bridgeUrl };
+        return { providers: list, bridgeUrl };
+      }
+    }
+  } catch {
+    // Local editor server not reachable (e.g. deployed Worker) — fall back to env.
+  }
+  const providers = envProviders(env);
+  providerCache = { at: now, providers, bridgeUrl };
+  return { providers, bridgeUrl };
+}
+
+// Best-effort activity log for the /settings/llm page; never blocks a reply.
+function logToBridge(bridgeUrl: string, entry: Record<string, unknown>): void {
+  void fetch(`${bridgeUrl}/llm/logs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ source: "worker", ...entry }),
+    signal: AbortSignal.timeout(1500),
+  }).catch(() => undefined);
+}
+
+async function callProvider(provider: LlmProvider, system: string, userMessage: string, maxTokens: number): Promise<string> {
+  const response = await fetch(`${provider.base_url}/chat/completions`, {
     method: "POST",
     headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
       "content-type": "application/json",
+      authorization: `Bearer ${provider.api_key}`,
     },
     body: JSON.stringify({
-      model: "claude-sonnet-5",
-      max_tokens: 1500,
-      system,
-      messages: [{ role: "user", content: userMessage }],
+      model: provider.model,
+      max_tokens: maxTokens,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: userMessage },
+      ],
     }),
+    signal: AbortSignal.timeout(provider.timeout_ms || 30_000),
   });
 
   if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Claude API error (${response.status}): ${errText}`);
+    const errText = await response.text().catch(() => "");
+    const error = new Error(`HTTP ${response.status}${errText ? `: ${errText.slice(0, 300)}` : ""}`) as Error & { status?: number };
+    error.status = response.status;
+    throw error;
   }
 
-  // Sonnet 5 puts extended-thinking blocks first — find the actual text block, not content[0].
-  const data = (await response.json()) as { content?: Array<{ type: string; text?: string }> };
-  return data.content?.find((block) => block.type === "text")?.text ?? "";
+  const data = (await response.json()) as {
+    choices?: Array<{ message?: { content?: ChatContent }; text?: string; finish_reason?: string }>;
+  };
+  const choice = data.choices?.[0];
+  const content: ChatContent = choice?.message?.content ?? choice?.text ?? "";
+  const text = Array.isArray(content)
+    ? content.map((part) => (typeof part === "string" ? part : part?.text || "")).join("")
+    : String(content || "");
+  if (!text.trim()) {
+    // Reasoning models can burn the whole budget on hidden reasoning tokens.
+    const error = new Error(
+      choice?.finish_reason === "length"
+        ? "empty completion: token budget exhausted by reasoning before any content (finish_reason=length)"
+        : "provider returned an empty completion"
+    ) as Error & { budgetExhausted?: boolean };
+    error.budgetExhausted = choice?.finish_reason === "length";
+    throw error;
+  }
+  return text;
+}
+
+async function callClaude(env: Env, system: string, userMessage: string): Promise<string> {
+  const { providers, bridgeUrl } = await loadProviders(env);
+  if (!providers.length) {
+    throw new Error(
+      "No LLM providers configured. Add one at http://localhost:5173/settings/llm or set ANTHROPIC_API_KEY / OPENAI_API_KEY in .dev.vars."
+    );
+  }
+
+  let lastError: Error | null = null;
+  for (let index = 0; index < providers.length; index += 1) {
+    const provider = providers[index];
+    const configuredTries = Math.max(1, (provider.max_retries ?? 0) + 1);
+    const maxTries = configuredTries + 1; // one extra slot for a token-budget bump
+    let budget = LLM_REQUEST_MAX_TOKENS;
+    let budgetBumped = false;
+
+    for (let attempt = 0; attempt < maxTries; attempt += 1) {
+      const startedAt = Date.now();
+      try {
+        const text = await callProvider(provider, system, userMessage, budget);
+        logToBridge(bridgeUrl, {
+          kind: "chat",
+          provider_name: provider.name,
+          model: provider.model,
+          fallback_index: index,
+          attempt,
+          success: 1,
+          latency_ms: Date.now() - startedAt,
+          status_code: 200,
+        });
+        return text;
+      } catch (error) {
+        lastError = error as Error;
+        const status = (error as { status?: number }).status;
+        const retryable = status === undefined || status === 429 || status >= 500;
+        logToBridge(bridgeUrl, {
+          kind: "chat",
+          provider_name: provider.name,
+          model: provider.model,
+          fallback_index: index,
+          attempt,
+          success: 0,
+          latency_ms: Date.now() - startedAt,
+          status_code: status ?? null,
+          error: lastError.message,
+        });
+        const budgetExhausted = (error as { budgetExhausted?: boolean }).budgetExhausted;
+        if (budgetExhausted && !budgetBumped && budget < 32768) {
+          budgetBumped = true;
+          budget = Math.max(budget * 4, 1024);
+          continue; // same provider, larger token budget
+        }
+        if (retryable && attempt < configuredTries - 1) continue;
+        break; // next provider in the fallback list
+      }
+    }
+  }
+
+  throw new Error(`All ${providers.length} LLM provider(s) failed. Last error: ${lastError?.message || "unknown"}`);
 }
 
 interface FFmpegCommandResult {
@@ -111,7 +308,7 @@ app.post("/api/ai-edit/start", async (c) => {
     c.executionCtx.waitUntil(
       (async () => {
         try {
-          const responseText = await callClaude(c.env.ANTHROPIC_API_KEY, FFMPEG_SYSTEM_PROMPT, prompt);
+          const responseText = await callClaude(c.env, FFMPEG_SYSTEM_PROMPT, prompt);
           const result = parseFFmpegResponse(responseText);
           pendingRequests.set(jobId, { status: "complete", result });
         } catch (error) {
@@ -163,7 +360,7 @@ app.post("/api/ai-edit", async (c) => {
       return c.json({ error: "Prompt is required" }, 400);
     }
 
-    const responseText = await callClaude(c.env.ANTHROPIC_API_KEY, FFMPEG_SYSTEM_PROMPT, prompt);
+    const responseText = await callClaude(c.env, FFMPEG_SYSTEM_PROMPT, prompt);
     const result = parseFFmpegResponse(responseText);
 
     return c.json({ success: true, ...result });
@@ -178,5 +375,10 @@ app.post("/api/ai-edit", async (c) => {
     );
   }
 });
+
+// SPA fallback — serve the built client for any non-API GET route (e.g. a
+// refresh on /settings/llm). `not_found_handling: single-page-application`
+// makes the assets binding return index.html for unknown paths.
+app.get("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 
 export default app;
