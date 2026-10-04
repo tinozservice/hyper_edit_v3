@@ -7,9 +7,12 @@ interface CaptionRendererProps {
   currentTime: number;  // Time within the caption clip
   isSelected?: boolean;
   onDragStart?: (e: React.MouseEvent) => void;
+  // Canvas-height / 650 (the export reference height). Keeps text proportional
+  // to the canvas when the preview panel is resized, matching the export.
+  fontScale?: number;
 }
 
-export default function CaptionRenderer({ words, style, currentTime, isSelected, onDragStart }: CaptionRendererProps) {
+export default function CaptionRenderer({ words, style, currentTime, isSelected, onDragStart, fontScale = 1 }: CaptionRendererProps) {
   // Apply time offset (negative = captions appear earlier, positive = later)
   const adjustedTime = currentTime - (style.timeOffset || 0);
 
@@ -73,25 +76,27 @@ export default function CaptionRenderer({ words, style, currentTime, isSelected,
 
   // Get text styles
   const textStyles = useMemo((): React.CSSProperties => {
+    const scale = Math.max(0.05, fontScale);
+    const stroke = (style.strokeWidth || 0) * scale;
     return {
       fontFamily: style.fontFamily,
-      fontSize: `${style.fontSize}px`,
+      fontSize: `${(style.fontSize || 24) * scale}px`,
       fontWeight: style.fontWeight === 'black' ? 900 : style.fontWeight === 'bold' ? 700 : 400,
       color: style.color,
-      textShadow: style.strokeWidth
+      textShadow: stroke
         ? `
-          -${style.strokeWidth}px -${style.strokeWidth}px 0 ${style.strokeColor},
-          ${style.strokeWidth}px -${style.strokeWidth}px 0 ${style.strokeColor},
-          -${style.strokeWidth}px ${style.strokeWidth}px 0 ${style.strokeColor},
-          ${style.strokeWidth}px ${style.strokeWidth}px 0 ${style.strokeColor}
+          -${stroke}px -${stroke}px 0 ${style.strokeColor},
+          ${stroke}px -${stroke}px 0 ${style.strokeColor},
+          -${stroke}px ${stroke}px 0 ${style.strokeColor},
+          ${stroke}px ${stroke}px 0 ${style.strokeColor}
         `
         : undefined,
       backgroundColor: style.backgroundColor,
-      padding: style.backgroundColor ? '4px 12px' : undefined,
-      borderRadius: style.backgroundColor ? '4px' : undefined,
+      padding: style.backgroundColor ? `${4 * scale}px ${12 * scale}px` : undefined,
+      borderRadius: style.backgroundColor ? `${4 * scale}px` : undefined,
       lineHeight: 1.4,
     };
-  }, [style]);
+  }, [style, fontScale]);
 
   // Get animation class/style for a word
   const getWordStyle = (wordIndex: number, word: CaptionWord): React.CSSProperties => {

@@ -2911,26 +2911,62 @@ async function handleProjectRender(req, res, sessionId) {
       }
       const trimDuration = outPoint - inPoint;
 
+      // ---- Match the editor preview exactly (VideoPreview.tsx) ----
+      //  • V1 (base): object-contain centered on the black canvas.
+      //  • V2/V3 image: width = scale × canvas width, top edge at 70% of the
+      //    canvas, horizontally centered (+ x/y offsets).
+      //  • V2/V3 video: object-contain, centered (+ x/y offsets), scaled.
+      // Overlay offsets are stored in 650px-reference pixels, same convention
+      // as the preview, so they scale with the output resolution.
+      const isBase = clip.trackId === 'V1';
+      const isOverlayImage = asset.type === 'image' && !isBase;
+      const t = clip.transform || {};
+      const scaleFactor = Math.max(0.01, Number.isFinite(t.scale) ? t.scale : (isOverlayImage ? 0.2 : 1));
+      const offsetScale = settings.height / 650;
+      const offsetX = Number.isFinite(t.x) ? Math.round(t.x * offsetScale) : 0;
+      const offsetY = Number.isFinite(t.y) ? Math.round(t.y * offsetScale) : 0;
+      const rotation = Number.isFinite(t.rotation) ? t.rotation : 0;
+      const opacity = Number.isFinite(t.opacity) ? Math.min(1, Math.max(0, t.opacity)) : 1;
+
       let clipFilter = `[${inputIdx}:v]`;
       clipFilter += `trim=${inPoint}:${outPoint},setpts=PTS-STARTPTS+${clip.start}/TB,`;
-      clipFilter += `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,`;
-      clipFilter += `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2`;
 
-      if (clip.transform) {
-        const { scale = 1 } = clip.transform;
-        if (scale !== 1) {
-          clipFilter += `,scale=iw*${scale}:ih*${scale}`;
+      if (isOverlayImage) {
+        // Preview: width = scale% of the canvas, height keeps the aspect.
+        clipFilter += `scale=w=${Math.max(2, Math.round(settings.width * scaleFactor))}:h=-2,`;
+      } else {
+        clipFilter += `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,`;
+        if (isBase) {
+          // Fill the base frame (black bars = canvas background, like preview).
+          clipFilter += `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2,`;
+        } else if (scaleFactor !== 1) {
+          clipFilter += `scale=iw*${scaleFactor}:ih*${scaleFactor},`;
         }
       }
 
+      // Rotation (overlay videos only — the preview ignores it for images/base)
+      if (!isBase && !isOverlayImage && rotation) {
+        clipFilter += `format=rgba,rotate=${rotation}*PI/180:c=none,`;
+      }
+      // Opacity (overlay layers)
+      if (!isBase && opacity < 1) {
+        clipFilter += `format=rgba,colorchannelmixer=aa=${opacity},`;
+      }
+
+      // Strip a trailing comma (branches end with one) so ffmpeg doesn't see
+      // an empty filter before the output label.
+      clipFilter = clipFilter.replace(/,\s*$/, '');
       clipFilter += `[v${inputIdx}]`;
       filterParts.push(clipFilter);
 
-      const overlayX = clip.transform?.x || `(W-w)/2`;
-      const overlayY = clip.transform?.y || `(H-h)/2`;
+      // Anchors: centered + offsets; images use the preview's 70%-top anchor.
+      const xExpr = offsetX ? `(W-w)/2+${offsetX}` : `(W-w)/2`;
+      const yExpr = isOverlayImage
+        ? (offsetY ? `H*0.7+${offsetY}` : `H*0.7`)
+        : (offsetY ? `(H-h)/2+${offsetY}` : `(H-h)/2`);
       const enable = `between(t,${clip.start},${clip.start + trimDuration})`;
 
-      filterParts.push(`[${lastVideo}][v${inputIdx}]overlay=x=${overlayX}:y=${overlayY}:enable='${enable}'[out${inputIdx}]`);
+      filterParts.push(`[${lastVideo}][v${inputIdx}]overlay=x=${xExpr}:y=${yExpr}:enable='${enable}'[out${inputIdx}]`);
       lastVideo = `out${inputIdx}`;
     }
 
@@ -3007,6 +3043,10 @@ async function handleProjectRender(req, res, sessionId) {
     ffmpegArgs.push(outputPath);
 
     console.log(`[${sessionId}] FFmpeg render command prepared`);
+    if (process.env.RENDER_DEBUG) {
+      console.log(`[${sessionId}] filter_complex: ${filterParts.join(';')}`);
+      console.log(`[${sessionId}] inputs: ${inputs.join(' ')}`);
+    }
 
     await runFFmpeg(ffmpegArgs, sessionId);
 

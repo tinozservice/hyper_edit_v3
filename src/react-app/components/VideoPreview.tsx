@@ -39,6 +39,8 @@ interface VideoPreviewProps {
   selectedLayerId?: string | null;
   // Caption/text drag: x/y are percentages of the canvas (0-100).
   onCaptionMove?: (layerId: string, xPercent: number, yPercent: number) => void;
+  // Preview zoom factor (CSS scale); keeps drag deltas in canvas pixels.
+  zoom?: number;
 }
 
 export interface VideoPreviewHandle {
@@ -47,14 +49,15 @@ export interface VideoPreviewHandle {
 }
 
 // Helper to build CSS styles from transform
-function getTransformStyles(transform?: ClipTransform, zIndex: number = 0, isDragging?: boolean): React.CSSProperties {
+function getTransformStyles(transform?: ClipTransform, zIndex: number = 0, isDragging?: boolean, offsetScale: number = 1): React.CSSProperties {
   const t = transform || {};
 
   const transforms: string[] = [];
 
-  // Position (translate)
+  // Position (translate) — offsets are stored in 650px-reference pixels and
+  // scaled to the current canvas so overlays keep their relative position.
   if (t.x || t.y) {
-    transforms.push(`translate(${t.x || 0}px, ${t.y || 0}px)`);
+    transforms.push(`translate(${(t.x || 0) * offsetScale}px, ${(t.y || 0) * offsetScale}px)`);
   }
 
   // Scale
@@ -94,6 +97,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
   onLayerSelect,
   selectedLayerId,
   onCaptionMove,
+  zoom = 1,
 }, ref) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const loadedSrcRef = useRef<string | null>(null);
@@ -109,6 +113,9 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
     startPctY: number;
     rect: DOMRect;
   } | null>(null);
+  // Canvas height, so caption text scales with the preview panel (the export
+  // scales fontSize from a 650px reference too).
+  const [canvasHeight, setCanvasHeight] = useState(0);
 
   // Find the base video layer (V1) for audio/playback control
   const foundBaseLayer = layers.find(l => l.trackId === 'V1' && l.type === 'video');
@@ -135,6 +142,23 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
     };
     return [...layers].sort((a, b) => getTrackOrder(a.trackId) - getTrackOrder(b.trackId));
   }, [layers]);
+
+  // Track the canvas height (layout px, unaffected by CSS zoom) so caption
+  // text stays proportional to the canvas when the panel is resized.
+  const hasLayers = layers.length > 0;
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver((entries) => {
+      const height = entries[0]?.contentRect.height || 0;
+      if (height > 0) setCanvasHeight(height);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasLayers]);
+  const captionFontScale = canvasHeight > 0 ? canvasHeight / 650 : 1;
+  // Same reference scale for overlay offsets (stored as 650px-reference px).
+  const offsetScale = captionFontScale;
 
   useImperativeHandle(ref, () => ({
     seekTo: (time: number) => {
@@ -288,8 +312,10 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
     if (!draggingLayer || !dragStart) return;
 
     const handleMouseMove = (e: MouseEvent) => {
-      const deltaX = e.clientX - dragStart.x;
-      const deltaY = e.clientY - dragStart.y;
+      // Deltas are screen pixels; divide by zoom (CSS scale) and by the
+      // 650px-reference scale so stored offsets stay canvas-relative.
+      const deltaX = (e.clientX - dragStart.x) / (zoom * offsetScale);
+      const deltaY = (e.clientY - dragStart.y) / (zoom * offsetScale);
 
       const newX = dragStart.layerX + deltaX;
       const newY = dragStart.layerY + deltaY;
@@ -309,7 +335,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [draggingLayer, dragStart, onLayerMove]);
+  }, [draggingLayer, dragStart, onLayerMove, zoom, offsetScale]);
 
   // Canvas di-fit ke tinggi panel (ResizableVerticalPanel) sambil menjaga
   // rasio width/height proyek, termasuk dimensi custom.
@@ -368,7 +394,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
         const isOverlay = layer.trackId !== 'V1';
         const isDragging = draggingLayer === layer.id;
         const isSelected = selectedLayerId === layer.id;
-        const styles = getTransformStyles(layer.transform, index + 2, isDragging);
+        const styles = getTransformStyles(layer.transform, index + 2, isDragging, offsetScale);
 
         if (layer.type === 'video') {
           return (
@@ -419,8 +445,8 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
                 className="absolute cursor-grab active:cursor-grabbing"
                 style={{
                   width: `${scale * 100}%`,
-                  top: `calc(70% + ${yOffset}px)`,
-                  left: `calc(50% + ${xOffset}px)`,
+                  top: `calc(70% + ${yOffset * offsetScale}px)`,
+                  left: `calc(50% + ${xOffset * offsetScale}px)`,
                   transform: 'translateX(-50%)',
                   zIndex: baseZIndex + 100,
                   opacity: layer.transform?.opacity ?? 1,
@@ -473,6 +499,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
               currentTime={layer.clipTime}
               isSelected={isSelected}
               onDragStart={(e) => handleCaptionMouseDown(e, layer)}
+              fontScale={captionFontScale}
             />
           );
         }

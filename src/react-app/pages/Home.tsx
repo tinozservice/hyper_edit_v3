@@ -19,7 +19,7 @@ import AspectRatioPicker from '@/react-app/components/AspectRatioPicker';
 import { formatSizeLabel, normalizeDimension } from '@/react-app/lib/videoFormats';
 import { useProject, Asset, TimelineClip, CaptionStyle } from '@/react-app/hooks/useProject';
 import { useVideoSession } from '@/react-app/hooks/useVideoSession';
-import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Film, Rocket, Scissors, Database, Settings, Youtube, Save, FolderOpen, Trash2, Loader2 } from 'lucide-react';
+import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Film, Rocket, Scissors, Database, Settings, Youtube, Save, FolderOpen, Trash2, Loader2, ZoomIn, ZoomOut } from 'lucide-react';
 import type { TemplateId } from '@/remotion/templates';
 import { SIZE_TO_SCALE, POSITION_TO_OFFSET, formatTime, type DirectorTimelineOp, type VaultPlacement, type TrackId } from '@/react-app/lib/directorOps';
 
@@ -28,6 +28,11 @@ interface ChapterData {
   youtubeFormat: string;
   summary: string;
 }
+
+// Canvas zoom bounds/step (preview only; does not change project settings)
+const ZOOM_MIN = 0.25;
+const ZOOM_MAX = 3;
+const ZOOM_STEP = 0.25;
 
 export default function Home() {
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
@@ -61,6 +66,30 @@ export default function Home() {
   const [showProjects, setShowProjects] = useState(false);
   const [projects, setProjects] = useState<SavedProject[]>([]);
   const [projectBusy, setProjectBusy] = useState<string | null>(null);
+
+  // Canvas zoom (preview only; does not change project/export settings)
+  const [previewZoom, setPreviewZoom] = useState(1);
+  const zoomIn = useCallback(() => {
+    setPreviewZoom((z) => Math.min(ZOOM_MAX, Math.round((z + ZOOM_STEP) * 100) / 100));
+  }, []);
+  const zoomOut = useCallback(() => {
+    setPreviewZoom((z) => Math.max(ZOOM_MIN, Math.round((z - ZOOM_STEP) * 100) / 100));
+  }, []);
+
+  // Preview viewport (scroll container) size — drives the canvas fit size and
+  // the scrollable area when zoomed in.
+  const previewScrollRef = useRef<HTMLDivElement>(null);
+  const [previewViewport, setPreviewViewport] = useState({ w: 0, h: 0 });
+  useEffect(() => {
+    const el = previewScrollRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver((entries) => {
+      const rect = entries[0]?.contentRect;
+      if (rect) setPreviewViewport({ w: rect.width, h: rect.height });
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   const videoPreviewRef = useRef<VideoPreviewHandle>(null);
   const playbackRef = useRef<number | null>(null);
@@ -109,6 +138,22 @@ export default function Home() {
     settings,
     setSettings,
   } = useProject();
+
+  // Canvas fit size inside the preview viewport (minus p-4 padding) and the
+  // effective view scale (display px / project px) shown by the zoom indicator.
+  const PREVIEW_PAD = 32;
+  const previewViewportH = previewViewport.h || Math.round(window.innerHeight * 0.45);
+  const previewViewportW = previewViewport.w || Math.round(window.innerWidth * 0.5);
+  const previewAspect = settings.width / settings.height || 1;
+  // Fit inside the viewport on both axes so zoom 100% never needs scrollbars.
+  const previewBaseH = Math.max(
+    80,
+    Math.min(previewViewportH - PREVIEW_PAD, (previewViewportW - PREVIEW_PAD) / previewAspect)
+  );
+  const previewBaseW = previewBaseH * previewAspect;
+  const previewScaledW = previewBaseW * previewZoom;
+  const previewScaledH = previewBaseH * previewZoom;
+  const previewViewScale = settings.height > 0 ? (previewBaseH * previewZoom) / settings.height : previewZoom;
 
   // Label rasio selalu diturunkan dari settings.width/height (sumber kebenaran
   // preview & ekspor), termasuk dimensi custom di luar preset.
@@ -2310,38 +2355,91 @@ export default function Home() {
             minHeight={220}
             maxHeight={Math.round(window.innerHeight * 0.85)}
             position="top"
-            className="flex items-center justify-center bg-zinc-900/30 p-4 overflow-hidden"
+            className="relative bg-zinc-900/30 overflow-hidden"
           >
-            {hasPreviewContent ? (
-              <VideoPreview
-                ref={videoPreviewRef}
-                layers={previewLayers}
-                isPlaying={isPlaying && !previewAssetId}
-                videoWidth={settings.width}
-                videoHeight={settings.height}
-                onLayerMove={handleLayerMove}
-                onLayerSelect={handleLayerSelect}
-                selectedLayerId={selectedClipId}
-                onCaptionMove={handleCaptionMove}
-              />
-            ) : clips.length > 0 ? (
-              // Assets exist but playhead is not over any clip
-              <div
-                className="relative h-full max-h-full w-auto bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10 flex items-center justify-center"
-                style={{ aspectRatio: `${settings.width} / ${settings.height}` }}
-              >
-                <div className="text-center text-zinc-600">
-                  <div className="text-sm">No clip at playhead</div>
-                  <div className="text-xs mt-1">Move playhead over a clip to preview</div>
-                </div>
-              </div>
-            ) : (
-              <div className="flex flex-col items-center justify-center text-zinc-500">
-                <Play className="w-16 h-16 mb-4 opacity-50" />
-                <p className="text-sm">Upload assets from the left panel</p>
-                <p className="text-xs text-zinc-600 mt-1">Drag them to the timeline below</p>
+            {/* Canvas zoom controls (preview only). The % shows the effective
+                view scale (display px / project px). */}
+            {(hasPreviewContent || clips.length > 0) && (
+              <div className="absolute top-3 right-3 z-20 flex items-center gap-0.5 bg-zinc-900/85 border border-zinc-700 rounded-lg px-1 py-0.5 shadow-lg">
+                <button
+                  onClick={zoomOut}
+                  disabled={previewZoom <= ZOOM_MIN}
+                  className="p-1.5 rounded hover:bg-zinc-700 disabled:opacity-40 disabled:hover:bg-transparent transition-colors"
+                  title="Zoom out kanvas"
+                >
+                  <ZoomOut className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  onClick={() => setPreviewZoom(1)}
+                  className="px-1.5 py-1 text-[11px] font-medium text-zinc-300 hover:bg-zinc-700 rounded min-w-[46px] transition-colors"
+                  title={`View ${Math.round(previewViewScale * 100)}% — fit ${Math.round((previewBaseH / settings.height) * 100)}% × zoom ${Math.round(previewZoom * 100)}%. Klik untuk reset zoom.`}
+                >
+                  {Math.round(previewViewScale * 100)}%
+                </button>
+                <button
+                  onClick={zoomIn}
+                  disabled={previewZoom >= ZOOM_MAX}
+                  className="p-1.5 rounded hover:bg-zinc-700 disabled:opacity-40 disabled:hover:bg-transparent transition-colors"
+                  title="Zoom in kanvas"
+                >
+                  <ZoomIn className="w-3.5 h-3.5" />
+                </button>
               </div>
             )}
+
+            {/* Scrollable canvas area: when zoomed past the panel, scrollbars
+                appear so the whole canvas can be inspected. */}
+            <div ref={previewScrollRef} className="h-full w-full overflow-auto [scrollbar-gutter:stable]">
+              {hasPreviewContent || clips.length > 0 ? (
+                <div
+                  className="flex items-center justify-center p-4"
+                  style={{
+                    width: Math.max(previewViewportW, previewScaledW + PREVIEW_PAD),
+                    height: Math.max(previewViewportH, previewScaledH + PREVIEW_PAD),
+                  }}
+                >
+                  <div style={{ width: previewScaledW, height: previewScaledH }}>
+                    <div
+                      style={{
+                        width: previewBaseW,
+                        height: previewBaseH,
+                        transform: `scale(${previewZoom})`,
+                        transformOrigin: 'top left',
+                      }}
+                    >
+                      {hasPreviewContent ? (
+                        <VideoPreview
+                          ref={videoPreviewRef}
+                          layers={previewLayers}
+                          isPlaying={isPlaying && !previewAssetId}
+                          videoWidth={settings.width}
+                          videoHeight={settings.height}
+                          onLayerMove={handleLayerMove}
+                          onLayerSelect={handleLayerSelect}
+                          selectedLayerId={selectedClipId}
+                          onCaptionMove={handleCaptionMove}
+                          zoom={previewZoom}
+                        />
+                      ) : (
+                        // Assets exist but playhead is not over any clip
+                        <div className="relative h-full w-full bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10 flex items-center justify-center">
+                          <div className="text-center text-zinc-600">
+                            <div className="text-sm">No clip at playhead</div>
+                            <div className="text-xs mt-1">Move playhead over a clip to preview</div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex h-full flex-col items-center justify-center text-zinc-500">
+                  <Play className="w-16 h-16 mb-4 opacity-50" />
+                  <p className="text-sm">Upload assets from the left panel</p>
+                  <p className="text-xs text-zinc-600 mt-1">Drag them to the timeline below</p>
+                </div>
+              )}
+            </div>
           </ResizableVerticalPanel>
 
           {/* Spacer that absorbs any leftover vertical room between the
