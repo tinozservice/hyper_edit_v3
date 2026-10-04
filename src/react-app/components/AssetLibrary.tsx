@@ -1,5 +1,5 @@
 import { useRef, useCallback } from 'react';
-import { Film, Image, Music, Upload, Trash2, Plus, Sparkles, ImageIcon } from 'lucide-react';
+import { Film, Image, Music, Upload, Trash2, Plus, Sparkles, ImageIcon, FileText } from 'lucide-react';
 import type { Asset } from '@/react-app/hooks/useProject';
 
 interface AssetLibraryProps {
@@ -18,6 +18,7 @@ const getAssetIcon = (type: Asset['type']) => {
     case 'video': return Film;
     case 'image': return Image;
     case 'audio': return Music;
+    case 'text': return FileText;
     default: return Film;
   }
 };
@@ -27,6 +28,7 @@ const getAssetColor = (type: Asset['type']) => {
     case 'video': return 'from-zinc-500 to-zinc-500';
     case 'image': return 'from-zinc-500 to-zinc-500';
     case 'audio': return 'from-zinc-500 to-zinc-500';
+    case 'text': return 'from-zinc-600 to-zinc-700';
     default: return 'from-gray-500 to-gray-600';
   }
 };
@@ -117,7 +119,7 @@ export default function AssetLibrary({
         ref={fileInputRef}
         type="file"
         multiple
-        accept="video/*,image/*,audio/*"
+        accept="video/*,image/*,audio/*,.txt,.md,.markdown,text/plain,text/markdown"
         onChange={handleFileChange}
         className="hidden"
       />
@@ -242,8 +244,7 @@ function AssetCard({ asset, isSelected, onSelect, onDelete, onDragStart }: Asset
       <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-2 py-1">
         <div className="text-[10px] text-white truncate">{asset.filename}</div>
         <div className="text-[9px] text-zinc-400">
-          {asset.type !== 'image' && formatDuration(asset.duration)}
-          {asset.type !== 'image' && ' • '}
+          {(asset.type === 'video' || asset.type === 'audio') && `${formatDuration(asset.duration)} • `}
           {formatSize(asset.size)}
         </div>
       </div>

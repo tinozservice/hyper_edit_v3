@@ -6,7 +6,7 @@ const SESSION_STORAGE_KEY = 'clipwise-session';
 // Asset - source file in library
 export interface Asset {
   id: string;
-  type: 'video' | 'image' | 'audio';
+  type: 'video' | 'image' | 'audio' | 'text';
   filename: string;
   duration: number;
   size: number;
@@ -323,6 +323,9 @@ export function useProject() {
         thumbnailUrl: result.asset.thumbnailUrl
           ? `${LOCAL_FFMPEG_URL}${result.asset.thumbnailUrl}`
           : null,
+        // Needed immediately (e.g. reading attached .txt/.md notes) without
+        // waiting for the next refreshAssets().
+        streamUrl: `${LOCAL_FFMPEG_URL}/session/${currentSession.sessionId}/assets/${result.asset.id}/stream`,
       };
 
       setAssets(prev => [...prev, asset]);
@@ -364,7 +367,7 @@ export function useProject() {
     const data = await response.json();
     const serverAssets: Asset[] = (data.assets || []).map((a: {
       id: string;
-      type: 'video' | 'image' | 'audio';
+      type: 'video' | 'image' | 'audio' | 'text';
       filename: string;
       duration: number;
       size: number;
@@ -744,6 +747,26 @@ export function useProject() {
     });
   }, []);
 
+  // Replace the text of a manual text/caption clip with a single word that
+  // spans the clip (transcribed captions keep their per-word timings).
+  const updateCaptionText = useCallback((clipId: string, text: string): void => {
+    setCaptionData(prev => {
+      const existing = prev[clipId];
+      if (!existing) return prev;
+      const first = existing.words[0];
+      const last = existing.words[existing.words.length - 1];
+      const start = first?.start ?? 0;
+      const end = last?.end ?? start + 3;
+      return {
+        ...prev,
+        [clipId]: {
+          ...existing,
+          words: [{ text, start, end }],
+        },
+      };
+    });
+  }, []);
+
   // Get caption data for a clip
   const getCaptionData = useCallback((clipId: string): CaptionData | null => {
     return captionData[clipId] || null;
@@ -770,6 +793,9 @@ export function useProject() {
             clips: clipsRef.current,
             settings: settingsRef.current,
             timelineTabs: timelineTabsRef.current,
+            // Text/caption clips keep their words+style here; without this the
+            // canvas text disappears on reload.
+            captions: captionDataRef.current,
           }),
         });
         console.log('[Project] Saved');
@@ -779,18 +805,40 @@ export function useProject() {
     }, 500);
   }, [session]);
 
-  // Load project from server (including assets)
-  const loadProject = useCallback(async (): Promise<void> => {
+  // Save immediately (no debounce) and resolve once the server has the file.
+  // Used by Save Project before snapshotting the session.
+  const flushProjectSave = useCallback(async (): Promise<void> => {
     if (!session) return;
+    if (saveTimeoutRef.current) {
+      clearTimeout(saveTimeoutRef.current);
+      saveTimeoutRef.current = null;
+    }
+    await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/project`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tracks: tracksRef.current,
+        clips: clipsRef.current,
+        settings: settingsRef.current,
+        timelineTabs: timelineTabsRef.current,
+        captions: captionDataRef.current,
+      }),
+    });
+  }, [session]);
+
+  // Load project from server (including assets)
+  const loadProject = useCallback(async (sessionIdOverride?: string): Promise<void> => {
+    const sid = sessionIdOverride || session?.sessionId;
+    if (!sid) return;
 
     try {
       // Fetch assets first
-      const assetsResponse = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/assets`);
+      const assetsResponse = await fetch(`${LOCAL_FFMPEG_URL}/session/${sid}/assets`);
       if (assetsResponse.ok) {
         const assetsData = await assetsResponse.json();
         const serverAssets: Asset[] = (assetsData.assets || []).map((a: {
           id: string;
-          type: 'video' | 'image' | 'audio';
+          type: 'video' | 'image' | 'audio' | 'text';
           filename: string;
           duration: number;
           size: number;
@@ -810,7 +858,7 @@ export function useProject() {
             ? `${LOCAL_FFMPEG_URL}${a.thumbnailUrl}`
             : null,
           // Add cache-busting timestamp to force reload after file changes
-          streamUrl: `${LOCAL_FFMPEG_URL}/session/${session.sessionId}/assets/${a.id}/stream?v=${Date.now()}`,
+          streamUrl: `${LOCAL_FFMPEG_URL}/session/${sid}/assets/${a.id}/stream?v=${Date.now()}`,
           // Preserve aiGenerated flag for Remotion-generated animations (critical for edit workflow detection)
           aiGenerated: a.aiGenerated || false,
         }));
@@ -818,13 +866,15 @@ export function useProject() {
       }
 
       // Then fetch project
-      const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/project`);
+      const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${sid}/project`);
       if (response.ok) {
         const data = await response.json();
         // Don't load tracks from server - always use client's default tracks
         // Server tracks may be outdated (e.g., missing T1, V3, A2)
         if (data.clips) setClips(data.clips);
         if (data.settings) setSettings(data.settings);
+        // Restore text/caption words + styles so canvas text survives reloads
+        if (data.captions) setCaptionData(data.captions);
         // Restore edit tabs (animations being edited in a separate tab).
         // The 'main' tab is hard-coded in initial state and never persisted.
         if (Array.isArray(data.timelineTabs) && data.timelineTabs.length > 0) {
@@ -839,6 +889,18 @@ export function useProject() {
       console.error('[Project] Load failed:', error);
     }
   }, [session]);
+
+  // Switch to another session (Open Project) and load its state.
+  const openProjectSession = useCallback(async (sessionId: string): Promise<void> => {
+    setSession({ sessionId, createdAt: Date.now() });
+    // Reset per-session UI state before loading the new one.
+    setActiveTabId('main');
+    setTimelineTabs([{ id: 'main', name: 'Main', type: 'main', clips: [] }]);
+    setCaptionData({});
+    setAssets([]);
+    setClips([]);
+    await loadProject(sessionId);
+  }, [setSession, loadProject]);
 
   // Render project
   // Uses refs to always get latest state
@@ -858,6 +920,7 @@ export function useProject() {
           clips: clipsRef.current,
           settings: settingsRef.current,
           timelineTabs: timelineTabsRef.current,
+          captions: captionDataRef.current,
         }),
       });
 
@@ -1026,11 +1089,14 @@ export function useProject() {
     addCaptionClip,
     addCaptionClipsBatch,
     updateCaptionStyle,
+    updateCaptionText,
     getCaptionData,
 
     // Project
     saveProject,
+    flushProjectSave,
     loadProject,
+    openProjectSession,
     renderProject,
     getDuration,
 

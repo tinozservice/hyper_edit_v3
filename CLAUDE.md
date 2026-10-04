@@ -73,17 +73,22 @@ Key endpoints on `localhost:3333`:
 - `POST /session/{id}/transcribe` - Whisper transcription for captions
 - `POST /session/{id}/render` - Render final video
 - `POST /session/{id}/render-motion-graphic` - Render Remotion animation
-- `POST /session/{id}/generate-animation` - AI-generated Remotion code (Gemini writes JSX → Remotion CLI renders)
-- `POST /session/{id}/edit-animation` - Modify existing Remotion source in-place (same asset ID reused after re-render)
+- `POST /session/{id}/generate-animation` - AI-generated Remotion animation (scene JSON from the LLM fallback pool → Remotion CLI renders)
+- `POST /session/{id}/edit-animation` - Modify an existing animation's scene data in-place via the LLM fallback pool (same asset ID reused after re-render)
 - `POST /session/{id}/process-asset` - Apply FFmpeg command to a specific asset (replaces in-place)
 - `POST /session/{id}/extract-audio` - Split video into muted video + audio on A1
-- `POST /session/{id}/generate-video` - Image-to-video via fal.ai (DiCaprio)
+- `POST /session/{id}/generate-video` - Image-to-video via the fallback pool's Video provider (fal.ai fallback)
 - `POST /session/{id}/restyle-video` - Video-to-video style transfer (DiCaprio)
 - `POST /session/{id}/remove-video-bg` - Background removal (DiCaprio)
 - `POST /session/{id}/generate-image` - fal.ai image generation (currently unused by the UI — Picasso agent was removed)
 - `POST /session/{id}/giphy/*` - GIPHY search/trending/add proxy
 - `POST /session/{id}/create-gif` - Animated GIF from image with motion effects
 - `POST /session/{id}/shorts/start` + `GET /session/{id}/shorts/status/{jobId}` - Shorts generator (see below)
+- `GET/POST /projects`, `POST /projects/{id}/open`, `PUT/DELETE /projects/{id}` - Saved projects (Save Project / Open Project)
+
+**Media library**: AI-generated media (Remotion animations, generated images/videos, restyle/remove-bg, b-roll) is moved by `attachAsset()`/`relocateAiAsset()` into `MEDIA_LIBRARY_DIR` (default `D:\Project\Shorts\Media-AI`), sorted into `YYYY-MM-DD` folders. Uploads stay in the session dir. `assets-meta.json` stores `libraryRelative` so restored sessions find the files; deleting a session never removes library media. A startup migration moves AI assets created before the library existed. `MEDIA_LIBRARY_DIR` is configurable in `.dev.vars`.
+
+**Saved projects**: `data/projects.json` maps project id → `{ name, sessionId, ... }`; each project also keeps a snapshot of `project.json` + `assets-meta.json` under `data/projects/<id>/`. Saved sessions are pinned (`isSessionPinned`) so the 2-hour auto-cleanup skips them; opening a project restores the session from disk or rebuilds it from the snapshot (missing uploads are dropped, library media survives).
 
 Sessions persist to `/tmp/hyperedit-ffmpeg/sessions/{sessionId}/` with assets, renders, project.json, and assets-meta.json (stores `aiGenerated`, `duration`, `editCount`).
 
@@ -110,8 +115,8 @@ When working on templates, use the `/remotion-best-practices` skill for domain-s
 
 Required in `.dev.vars` for local development:
 - `ANTHROPIC_API_KEY` - Claude Sonnet 5 (`claude-sonnet-5`), powers the actual chat/prompt orchestration for all three agents: Director's prompt→FFmpeg-command engine (worker `/api/ai-edit*`), DiCaprio's prompt enhancement, Creator OS's command planner
-- `GEMINI_API_KEY` - Google AI, still powers deeper multimodal helpers in `local-ffmpeg-server.js` (video/transcript analysis, Remotion animation JSX generation, chapter detection) that rely on Gemini's native video-file understanding — not swapped to Claude
-- `FAL_API_KEY` - fal.ai for DiCaprio's actual video generation calls (note: server aliases this to `FAL_KEY` for the fal.ai SDK)
+- `GEMINI_API_KEY` - Google AI, now only a last-resort fallback for multimodal helpers in `local-ffmpeg-server.js` (audio/video transcription fallback, B-roll image generation, chapter detection). Text-only LLM work (animation scene generation, transcript analysis, prompt enhancement) goes through the `/settings/llm` fallback pool (`data/llm.db`) first and only falls back to this key when the pool has no Chat provider.
+- `FAL_API_KEY` - fal.ai for DiCaprio's Restyle Video / Remove Background calls and the Animate Image fallback (note: server aliases this to `FAL_KEY` for the fal.ai SDK). Animate Image prefers a **Video** provider in the `/settings/llm` fallback pool (OpenRouter async `/videos`, e.g. `heygen/heygen-video-1`) when one is enabled.
 - `GIPHY_API_KEY` - GIF search
 - `OPENAI_API_KEY` - Whisper fallback and Director voice replies (OpenAI TTS `tts-1`; without it voice mode falls back to browser `speechSynthesis`)
 - `TYPESAFE_API_KEY` - Jev (TypeSafe System One). Powers Director workflow routing and Obsidian search reranking. Optional: every Jev call site degrades to keyword logic when unset. Key from https://console.typesafe.ai/keys
@@ -122,7 +127,7 @@ Required in `.dev.vars` for local development:
 The right panel has five tabs (four chat agents plus the Shorts generator). All panels are always mounted but toggled with `hidden` CSS class to preserve chat state.
 - **Director** (AIPromptPanel): Video editing commands, captions, motion graphics, animations
 - **Obsidian** (ObsidianPanel): Jev the media agent over the Marketing OS Broll vault; singular asks import one file, plural asks list them all (see below)
-- **DiCaprio** (DiCaprioPanel): Video generation with Animate Image (Kling v1.5), Restyle Video (LTX-2 19B), Remove Background (Bria)
+- **DiCaprio** (DiCaprioPanel): Video generation with Animate Image (Video provider from `/settings/llm`, or fal.ai Kling v1.5 as fallback), Restyle Video (LTX-2 19B), Remove Background (Bria)
 - **Creator OS** (CreatorOSPanel): Publishes the rendered timeline to social media
 - **Shorts** (ShortsPanel): Not a chat agent — a form that finds viral moments in a long video and cuts vertical shorts (see Shorts Generator below)
 
@@ -141,7 +146,8 @@ The right panel has five tabs (four chat agents plus the Shorts generator). All 
 The Director no longer requires a video to be uploaded before you can talk to it: the input, send, attach and voice controls are always enabled, and workflows that need footage reply with "upload a video first" instead. The Director can be driven voice-to-voice. `src/react-app/hooks/useVoiceDirector.ts` wraps the browser Web Speech API for input (Chrome/Edge/Safari; no server round-trip) and speaks replies via `POST /director/tts` (OpenAI `tts-1`, voice `onyx`, overridable with `DIRECTOR_TTS_VOICE`/`DIRECTOR_TTS_MODEL`), falling back to `speechSynthesis` on any non-200. In `AIPromptPanel.tsx`:
 - The mic button is push-to-talk: the final transcript is submitted through `handleSubmit(undefined, text)` (the `overrideText` parameter exists for this).
 - The headphones button toggles **voice mode**: every new assistant message is spoken (`toSpeakable` strips markdown/code and caps length), then the mic re-arms automatically unless the panel is busy. The mic is never open while the Director is speaking.
-- Workflow routing asks Jev first: `routeWithJev` posts the prompt plus editor context to `POST /director/route`, where `handleDirectorRoute` asks one Choice over the 13 `WorkflowType`s (descriptions in `DIRECTOR_WORKFLOWS`) and one Noul ("does this refer to the existing animation?") in a single call, applies a deterministic override toward `edit-animation` when an animation is in context, and returns `{workflow, confidence, latencyMs}`. The client uses it only when `confidence >= 0.35` and the call answers within 4s; otherwise the keyword `determineWorkflow` decides. Both results are logged to the console for comparison.
+- Workflow routing asks Jev first: `routeWithJev` posts the prompt plus editor context (including whether an image is attached in the chat) to `POST /director/route`, where `handleDirectorRoute` asks one Choice over the 14 `WorkflowType`s (descriptions in `DIRECTOR_WORKFLOWS`) and one Noul ("does this refer to the existing animation?") in a single call, applies deterministic overrides toward `edit-animation` when an animation is in context and toward `animate-image` when an attached image plus an explicit image-to-video request would otherwise be routed to FFmpeg/Remotion, and returns `{workflow, confidence, latencyMs}`. The client uses it only when `confidence >= 0.35` and the call answers within 4s; otherwise the keyword `determineWorkflow` decides. Both results are logged to the console for comparison. `animate-image` runs DiCaprio's image-to-video (`/session/:id/generate-video`, Video provider from `/settings/llm`) and drops the result on V2 at the playhead.
+- **Notes as instructions (`.txt`/`.md`)**: uploads with those extensions become `text` assets (server type detection; no thumbnail/duration). They appear in the asset library and can be attached in the Director chat via the paperclip, drag-and-drop, or the **Add asset from library** (`+`) picker. `buildNoteContext()` fetches the file (capped at 6000 chars per note) and prepends `[Attached note: …]` to the prompt, so the content informs both Jev routing and the workflow LLM call. Text notes are never placed on the timeline (drop is ignored) and are filtered out of `attachedAssetIds` sent to the Remotion generator.
 - **Obsidian voice mode**: `ObsidianPanel.tsx` uses the same hook with a `VoicePersona` (`BUTLER`): OpenAI voice `fable` with butler delivery `instructions` (the server switches to `gpt-4o-mini-tts` whenever instructions are sent, since `tts-1` ignores them), and a browser fallback that prefers the macOS "Grandpa (English (UK))" / "Daniel" en-GB voices. Replies are one clipped sentence ("Vercel logo, in your media now. 12 more exist."). In voice mode a singular ask imports its file and a plural ask of ≤15 rows imports all of them; larger plural asks are listed and Jev asks which.
 - **Timeline operations and vault media** (`timeline-op`, `vault-media` workflows): the same routing call also asks Jev for a `DirectorTimelineOp` (operation, target, track, destination track, direction, size, position; see `src/react-app/lib/directorOps.ts`), with numbers (seconds, mm:ss, percentages) parsed by regex in `parseTimelineNumbers`. The client sends the active timeline's clips as labels (`V1 · intro.mp4 · 0:00–0:30`) so Jev can target a clip by name (`clip:<id>`) as well as `selected`, `at_playhead`, `first`, `last`, `all_on_track`, `everything`. `executeDirectorTimelineOp` in Home.tsx runs delete, split, move, trim/extend start/end, set_duration, scale, position, seek, play, pause, clear_track against the active tab through the existing handlers and returns a one-line result for the chat. `placeVaultMedia` asks Jev the media agent (`/session/:id/obsidian/search`), imports the row(s), refreshes assets, and places them: images on V3 at the playhead with a size/position preset (default small, top-right), videos on V1 if V1 is empty else V2, audio on A1; a plural ask lays files out back to back. A confident timeline verb overrides a generic FFmpeg/animation bucket server-side unless an animation is in context.
 - `scripts/jev.js` is the shared plain-`fetch` client (`askJev(state, questions)`, `choice/noul/score` builders, retries 429/529). Ask all questions for one decision in a single request; Jev evaluates them in parallel.
@@ -178,7 +184,7 @@ The three chat-driven agents all delegate their actual prompt understanding to C
 - **DiCaprio**: `handleGenerateVideo` (Kling image-to-video) and `handleRestyleVideo` (LTX-2 style transfer) in `scripts/local-ffmpeg-server.js` use `callClaude()` to expand a short user prompt into a detailed cinematic one before calling fal.ai. `handleRemoveVideoBg` has no prompt to enhance.
 - **Creator OS**: `handleCreatorOSChat`, see above.
 
-This was a deliberate, scoped swap — only the free-text "what does the user want" entry points moved to Claude. The ~20 other `GoogleGenAI`/Gemini call sites elsewhere in `local-ffmpeg-server.js` (transcript/broll analysis, animation JSX generation, chapter detection, contextual/transcript animations) are untouched and still require `GEMINI_API_KEY` — those depend on Gemini's native video-file understanding, which is a separate capability from chat orchestration.
+This was a deliberate, scoped swap — only the free-text "what does the user want" entry points moved to Claude. Text-only Gemini call sites in `local-ffmpeg-server.js` (animation scene generation, transcript analysis, prompt enhancement) now go through the `/settings/llm` fallback pool (`generateText()` → `chatCompletion()`) and only use `GEMINI_API_KEY` when the pool is empty. The remaining `GoogleGenAI` sites are multimodal (audio/video transcription fallback, B-roll image generation, chapter detection) and still require `GEMINI_API_KEY`.
 
 ## UI Layout Conventions
 

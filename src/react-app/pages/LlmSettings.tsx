@@ -25,11 +25,11 @@ import {
 // Sumber datanya adalah SQLite milik server editor lokal
 // (scripts/local-ffmpeg-server.js → scripts/llm-pool.js). Setiap provider
 // selalu terdiri dari base URL + API key + model dan dicoba berurutan saat
-// request chat/transkripsi/TTS gagal atau timeout.
+// request chat/transkripsi/TTS/video gagal atau timeout.
 
 const API = "http://localhost:3333";
 
-type PoolKind = "chat" | "transcription" | "tts";
+type PoolKind = "chat" | "transcription" | "tts" | "video";
 
 interface Provider {
   id: number;
@@ -44,6 +44,7 @@ interface Provider {
   chat_enabled: boolean;
   transcribe_enabled: boolean;
   tts_enabled: boolean;
+  video_enabled: boolean;
   priority: number;
   has_api_key: boolean;
   api_key_masked: string;
@@ -67,6 +68,12 @@ const POOL_META: Record<PoolKind, { label: string; hint: string; isEnabled: (p: 
     label: "TTS",
     hint: "Suara Direktur (/audio/speech)",
     isEnabled: (p) => p.tts_enabled !== false,
+  },
+  video: {
+    label: "Video",
+    hint: "DiCaprio Animate Image (OpenRouter /videos async)",
+    // === true: server lama tidak mengirim field ini; video default nonaktif.
+    isEnabled: (p) => p.video_enabled === true,
   },
 };
 
@@ -118,6 +125,7 @@ interface FormState {
   chat_enabled: boolean;
   transcribe_enabled: boolean;
   tts_enabled: boolean;
+  video_enabled: boolean;
 }
 
 const EMPTY_FORM: FormState = {
@@ -134,6 +142,8 @@ const EMPTY_FORM: FormState = {
   chat_enabled: true,
   transcribe_enabled: true,
   tts_enabled: true,
+  // Model video bukan model chat; jangan ikut daftar fallback lain.
+  video_enabled: false,
 };
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -170,6 +180,7 @@ function formFromProvider(provider: Provider): FormState {
     chat_enabled: provider.chat_enabled !== false,
     transcribe_enabled: provider.transcribe_enabled !== false,
     tts_enabled: provider.tts_enabled !== false,
+    video_enabled: provider.video_enabled === true,
   };
 }
 
@@ -239,6 +250,7 @@ export default function LlmSettingsPage() {
         chat_enabled: form.chat_enabled,
         transcribe_enabled: form.transcribe_enabled,
         tts_enabled: form.tts_enabled,
+        video_enabled: form.video_enabled,
         ...(form.api_key ? { api_key: form.api_key } : {}),
       };
       if (form.id === null) {
@@ -390,7 +402,7 @@ export default function LlmSettingsPage() {
           <div>
             <h1 className="text-lg font-bold">Fallback LLM</h1>
             <p className="text-xs text-zinc-500">
-              Daftar provider OpenAI-compatible per layanan — chat, transkripsi, dan TTS punya urutan fallback sendiri
+              Daftar provider OpenAI-compatible per layanan — chat, transkripsi, TTS, dan video punya urutan fallback sendiri
             </p>
           </div>
         </div>
@@ -591,6 +603,15 @@ export default function LlmSettingsPage() {
                   />
                   TTS
                 </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={form.video_enabled}
+                    onChange={(e) => setForm({ ...form, video_enabled: e.target.checked })}
+                    className="accent-zinc-400"
+                  />
+                  Video
+                </label>
               </div>
               <div className="flex gap-2">
                 <button onClick={() => setForm(null)} className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg text-sm">
@@ -718,6 +739,9 @@ export default function LlmSettingsPage() {
                               {provider.tts_enabled !== false && (
                                 <span className="text-[10px] px-1 py-0.5 rounded bg-zinc-800 text-zinc-500">tts</span>
                               )}
+                              {provider.video_enabled === true && (
+                                <span className="text-[10px] px-1 py-0.5 rounded bg-zinc-800 text-zinc-500">video</span>
+                              )}
                             </span>
                           </div>
                           <div className="text-xs text-zinc-500 font-mono truncate">{provider.base_url}</div>
@@ -838,10 +862,11 @@ export default function LlmSettingsPage() {
         </section>
 
         <p className="text-xs text-zinc-500 leading-relaxed">
-          Cara kerja: tiap layanan punya daftar fallback sendiri — tab <em>Chat</em>, <em>Transkripsi</em>, dan <em>TTS</em>{" "}
-          di atas. Hanya provider dengan layanan tersebut aktif yang dicoba, berurutan dari atas. Error jaringan, timeout,
-          HTTP 429/5xx, atau model reasoning yang kehabisan token di-retry otomatis lalu lanjut ke provider berikutnya.
-          Semua percobaan dicatat di tabel log (kolom <em>Jenis</em> menunjukkan layanannya).
+          Cara kerja: tiap layanan punya daftar fallback sendiri — tab <em>Chat</em>, <em>Transkripsi</em>, <em>TTS</em>, dan{" "}
+          <em>Video</em> di atas. Hanya provider dengan layanan tersebut aktif yang dicoba, berurutan dari atas. Error jaringan,
+          timeout, HTTP 429/5xx, atau model reasoning yang kehabisan token di-retry otomatis lalu lanjut ke provider berikutnya.
+          Video memakai API async OpenRouter (<code>/videos</code>: submit → polling → unduh) dan berbiaya per detik. Semua
+          percobaan dicatat di tabel log (kolom <em>Jenis</em> menunjukkan layanannya).
         </p>
       </main>
     </div>

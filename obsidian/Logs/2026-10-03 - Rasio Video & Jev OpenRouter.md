@@ -42,6 +42,41 @@ JEV_MODEL=typesafe/jev-1.13
 ```
 (atau `~typesafe/jev-latest` bila ingin ikut versi terbaru). `TYPESAFE_API_KEY` boleh dikosongkan; bila keduanya terisi, OpenRouter yang dipakai. Restart `npm run ffmpeg-server`.
 
+## 3. Perbaikan warning "Vault mirror sync failed: spawn rsync ENOENT"
+
+Dilaporkan dari panel Obsidian/JEV di Windows: banner kuning `spawn rsync ENOENT` dan 0 clips/0 images.
+
+**Penyebab:** agen media menyalin vault iCloud ke mirror lokal memakai `rsync` (tidak ada di Windows), dan path vault default menunjuk ke folder macOS milik developer asli (`/Users/<user>/...`). Keduanya membuat sync selalu gagal dan isi index kosong.
+
+**Perbaikan `scripts/obsidian-agent.js`:**
+- Mode **direct** otomatis saat `rsync` tidak tersedia (Windows): index, thumbnail, dan import membaca vault di tempat; `syncMirror()` menjadi no-op tanpa spawn proses.
+- Vault yang tidak ada tidak lagi menghasilkan banner "mirror sync failed" — status bersih (`vaultExists: false`), panel menampilkan petunjuk `OBSIDIAN_VAULT_PATH`.
+- `OBSIDIAN_VAULT_DIRECT=1/0` untuk memaksa mode. macOS tetap memakai mirror rsync (perilaku lama).
+- Status kini menyertakan `mirror.mode`; panel menampilkan nama folder vault sebenarnya + penanda "dibaca langsung".
+
+**Hasil uji (vault lokal 2 media + sidecar):** ✅ `mode: direct`, index 2 item (1 video, 1 image), `syncMirror` tanpa error, pencarian "the claude logo" menemukan item yang tepat, vault hilang → status bersih tanpa banner.
+
+**Cara pakai di Windows:** isi `.dev.vars`:
+```ini
+OBSIDIAN_VAULT_PATH=D:\Media\Vault
+```
+Vault berisi file media + note `.md` dengan frontmatter (`name`, `type`, `file`, `brand`, …) seperti struktur Marketing OS Broll. Restart `npm run ffmpeg-server`.
+
+## 4. Vault media contoh + upload YouTube native
+
+**Vault contoh** di `obsidian/Media_Projek` (dibaca mode direct):
+- `_Panduan Vault Media.md` — penjelasan struktur + tabel frontmatter.
+- Contoh: `ai-companies/Claude/claude-logo.md`, `brand-assets/creator-os/creator-os-icon.md`, `video-broll/basketball/basketball-clip.md` (+ media contoh).
+- Uji: 3 item terindeks (2 gambar, 1 video); query "the claude logo", "creator os icon", "basketball footage" menemukan item yang tepat.
+
+**Upload YouTube native (pengganti CreatorOS untuk YouTube):**
+- `scripts/youtube-client.js` — OAuth offline (refresh token di `data/youtube.db`), resumable upload `videos.insert`, thumbnail `thumbnails.set`, riwayat upload.
+- Endpoint: `/youtube/status`, `/youtube/oauth/start`, `/youtube/oauth/callback`, `/youtube/upload`, `/youtube/uploads`, `/youtube/disconnect`.
+- Panel baru **YouTube** di editor: hubungkan channel, pilih sumber (render terbaru / asset short), judul–deskripsi–tag–visibilitas, unggah, tautan Shorts/Studio, riwayat.
+- `#Shorts` otomatis untuk video vertikal ≤ 3 menit; visibilitas default *unlisted*.
+- Uji mock Google API: ✅ OAuth (state, code, channel), upload resumable (metadata + bytes + thumbnail), riwayat sukses/gagal, disconnect.
+- Setup OAuth langkah demi langkah: [[../Panduan Upload YouTube|Panduan Upload YouTube]].
+
 ## Langkah berikutnya
 
 - Restart `npm run ffmpeg-server` + `npm run dev`; muat ulang halaman.

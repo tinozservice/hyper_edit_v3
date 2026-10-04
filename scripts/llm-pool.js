@@ -58,6 +58,7 @@ function db() {
       chat_enabled INTEGER NOT NULL DEFAULT 1,
       transcribe_enabled INTEGER NOT NULL DEFAULT 1,
       tts_enabled INTEGER NOT NULL DEFAULT 1,
+      video_enabled INTEGER NOT NULL DEFAULT 0,
       priority INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -90,6 +91,8 @@ function db() {
 // Databases created before per-service pools exist get the three capability
 // columns added in place. Default 1 keeps the previous behavior (provider was
 // used for every endpoint) until the user unchecks unsupported services.
+// `video_enabled` is separate: video generation is a new capability, so it
+// defaults to 0 and only providers the user marks as video are tried.
 function migrateProviderCapabilities(conn) {
   const columns = conn.prepare(`PRAGMA table_info(llm_providers)`).all().map((row) => row.name);
   for (const column of ['chat_enabled', 'transcribe_enabled', 'tts_enabled']) {
@@ -97,6 +100,10 @@ function migrateProviderCapabilities(conn) {
       conn.exec(`ALTER TABLE llm_providers ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 1`);
       console.log(`[llm-pool] Migrasi: kolom ${column} ditambahkan`);
     }
+  }
+  if (!columns.includes('video_enabled')) {
+    conn.exec(`ALTER TABLE llm_providers ADD COLUMN video_enabled INTEGER NOT NULL DEFAULT 0`);
+    console.log(`[llm-pool] Migrasi: kolom video_enabled ditambahkan`);
   }
 }
 
@@ -186,6 +193,7 @@ function rowToPublic(row) {
     chat_enabled: Boolean(row.chat_enabled),
     transcribe_enabled: Boolean(row.transcribe_enabled),
     tts_enabled: Boolean(row.tts_enabled),
+    video_enabled: Boolean(row.video_enabled),
     priority: row.priority,
     has_api_key: Boolean(row.api_key),
     api_key_masked: maskApiKey(row.api_key),
@@ -208,6 +216,7 @@ function rowToRuntime(row) {
     chat_enabled: Boolean(row.chat_enabled),
     transcribe_enabled: Boolean(row.transcribe_enabled),
     tts_enabled: Boolean(row.tts_enabled),
+    video_enabled: Boolean(row.video_enabled),
     priority: row.priority,
   };
 }
@@ -227,6 +236,7 @@ function sanitizeProviderInput(input, { partial = false } = {}) {
   if (has('chat_enabled')) out.chat_enabled = input.chat_enabled ? 1 : 0;
   if (has('transcribe_enabled')) out.transcribe_enabled = input.transcribe_enabled ? 1 : 0;
   if (has('tts_enabled')) out.tts_enabled = input.tts_enabled ? 1 : 0;
+  if (has('video_enabled')) out.video_enabled = input.video_enabled ? 1 : 0;
   if (has('timeout_ms')) out.timeout_ms = Math.max(1000, Math.min(600000, parseInt(input.timeout_ms, 10) || DEFAULT_TIMEOUT_MS));
   if (has('max_retries')) out.max_retries = Math.max(0, Math.min(10, parseInt(input.max_retries, 10) || 0));
 
@@ -275,6 +285,7 @@ const PROVIDER_CAPABILITY_COLUMNS = {
   chat: 'chat_enabled',
   transcription: 'transcribe_enabled',
   tts: 'tts_enabled',
+  video: 'video_enabled',
 };
 
 export function getRuntimeProviders(capability = 'chat') {
@@ -296,8 +307,8 @@ export function createProvider(input) {
   const maxPriority = db().prepare(`SELECT COALESCE(MAX(priority), -1) AS m FROM llm_providers`).get().m;
   const result = db()
     .prepare(
-      `INSERT INTO llm_providers (name, base_url, api_key, model, transcribe_model, tts_model, timeout_ms, max_retries, enabled, chat_enabled, transcribe_enabled, tts_enabled, priority)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO llm_providers (name, base_url, api_key, model, transcribe_model, tts_model, timeout_ms, max_retries, enabled, chat_enabled, transcribe_enabled, tts_enabled, video_enabled, priority)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       data.name,
@@ -312,6 +323,7 @@ export function createProvider(input) {
       data.chat_enabled ?? 1,
       data.transcribe_enabled ?? 1,
       data.tts_enabled ?? 1,
+      data.video_enabled ?? 0,
       maxPriority + 1
     );
   return getProviderRow(Number(result.lastInsertRowid));
@@ -335,6 +347,7 @@ export function updateProvider(id, input) {
     chat_enabled: data.chat_enabled !== undefined ? data.chat_enabled : existing.chat_enabled,
     transcribe_enabled: data.transcribe_enabled !== undefined ? data.transcribe_enabled : existing.transcribe_enabled,
     tts_enabled: data.tts_enabled !== undefined ? data.tts_enabled : existing.tts_enabled,
+    video_enabled: data.video_enabled !== undefined ? data.video_enabled : existing.video_enabled,
   };
 
   if (data.clear_api_key) next.api_key = '';
@@ -349,7 +362,7 @@ export function updateProvider(id, input) {
       `UPDATE llm_providers
        SET name = ?, base_url = ?, api_key = ?, model = ?, transcribe_model = ?, tts_model = ?,
            timeout_ms = ?, max_retries = ?, enabled = ?, chat_enabled = ?, transcribe_enabled = ?, tts_enabled = ?,
-           updated_at = datetime('now')
+           video_enabled = ?, updated_at = datetime('now')
        WHERE id = ?`
     )
     .run(
@@ -365,6 +378,7 @@ export function updateProvider(id, input) {
       next.chat_enabled,
       next.transcribe_enabled,
       next.tts_enabled,
+      next.video_enabled,
       Number(id)
     );
   return getProviderRow(Number(id));
@@ -426,10 +440,18 @@ export function poolStatus() {
 
 // ---------------------------------------------------------------- transport
 
+// Accepts either a path relative to the provider base URL or an absolute URL
+// (OpenRouter returns absolute polling URLs).
+function resolveProviderUrl(provider, pathOrUrl) {
+  const value = String(pathOrUrl || '');
+  if (/^https?:\/\//i.test(value)) return value;
+  return `${trimSlash(provider.base_url)}${value.startsWith('/') ? value : `/${value}`}`;
+}
+
 function providerFetch(provider, path, { method = 'POST', headers = {}, body, timeoutMs } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs || provider.timeout_ms || DEFAULT_TIMEOUT_MS);
-  const url = `${trimSlash(provider.base_url)}${path}`;
+  const url = resolveProviderUrl(provider, path);
   return fetch(url, {
     method,
     headers: {
@@ -478,7 +500,7 @@ function extractChatText(data) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // One provider, up to max_retries retries for retryable failures (429/5xx/network/timeout).
-async function chatWithProviders(providers, { system, messages, maxTokens = 1024, temperature, jsonMode = false, kind = 'chat', source = 'server' }) {
+async function chatWithProviders(providers, { system, messages, maxTokens = 1024, temperature, jsonMode = false, kind = 'chat', source = 'server', timeoutMs }) {
   const chatMessages = messages || (system ? [{ role: 'system', content: system }] : []);
 
   let lastError = null;
@@ -503,6 +525,7 @@ async function chatWithProviders(providers, { system, messages, maxTokens = 1024
             ...(temperature !== undefined ? { temperature } : {}),
             ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
           }),
+          timeoutMs,
         });
         const data = await res.json();
         const text = extractChatText(data);
@@ -584,6 +607,7 @@ export async function chatCompletion({
   kind = 'chat',
   source = 'server',
   legacyApiKey,
+  timeoutMs,
 } = {}) {
   let providers = getRuntimeProviders();
   if (!providers.length && legacyApiKey) {
@@ -605,7 +629,7 @@ export async function chatCompletion({
   const finalMessages =
     messages ||
     [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: user ?? '' }];
-  return chatWithProviders(providers, { messages: finalMessages, maxTokens, temperature, jsonMode, kind, source });
+  return chatWithProviders(providers, { messages: finalMessages, maxTokens, temperature, jsonMode, kind, source, timeoutMs });
 }
 
 // Kept for call sites that used to talk to the Anthropic Messages API.
@@ -751,6 +775,136 @@ export async function synthesizeSpeech({
   throw new Error(`All ${providers.length} provider(s) failed for TTS. Last error: ${lastError?.message || 'unknown error'}`);
 }
 
+// ---------------------------------------------------------------- video
+
+const DEFAULT_VIDEO_POLL_INTERVAL_MS = 5000;
+const DEFAULT_VIDEO_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Video generation through the fallback list. Video models use OpenRouter's
+ * asynchronous API: POST {base_url}/videos returns { id, polling_url, status },
+ * which is polled until `completed`, then the MP4 is downloaded from
+ * `unsigned_urls[0]` (or /videos/{id}/content).
+ *
+ * `imageDataUrl` (a `data:image/...;base64,...` string) is sent as a
+ * first-frame image for image-to-video models.
+ *
+ * @returns {{ buffer: Buffer, provider: string, model: string, fallback_index: number, latencyMs: number, jobId: string, cost: number|null }}
+ */
+export async function generateVideo({
+  prompt,
+  imageDataUrl,
+  duration,
+  resolution,
+  aspectRatio,
+  generateAudio,
+  kind = 'video',
+  source = 'server',
+  pollIntervalMs = DEFAULT_VIDEO_POLL_INTERVAL_MS,
+  timeoutMs = DEFAULT_VIDEO_TIMEOUT_MS,
+} = {}) {
+  const providers = getRuntimeProviders('video');
+  if (!providers.length) {
+    const error = new Error('No video provider enabled. Aktifkan layanan "Video" pada salah satu provider di /settings/llm.');
+    error.code = 'video-not-configured';
+    throw error;
+  }
+
+  let lastError = null;
+
+  for (let index = 0; index < providers.length; index += 1) {
+    const provider = providers[index];
+    const startedAt = Date.now();
+
+    try {
+      const submitBody = {
+        model: provider.model,
+        ...(prompt ? { prompt } : {}),
+        ...(duration ? { duration: Number(duration) } : {}),
+        ...(resolution ? { resolution } : {}),
+        ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
+        ...(generateAudio !== undefined ? { generate_audio: Boolean(generateAudio) } : {}),
+        ...(imageDataUrl
+          ? {
+              frame_images: [
+                { type: 'image_url', image_url: { url: imageDataUrl }, frame_type: 'first_frame' },
+              ],
+            }
+          : {}),
+      };
+
+      const submitRes = await providerFetch(provider, '/videos', {
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(submitBody),
+      });
+      let job = await submitRes.json();
+      const jobId = job?.id || '';
+      const pollingUrl = job?.polling_url || (jobId ? `/videos/${jobId}` : null);
+      if (!pollingUrl) throw new Error('video provider did not return a polling_url');
+
+      const deadline = Date.now() + timeoutMs;
+      while (job.status !== 'completed') {
+        if (['failed', 'cancelled', 'expired'].includes(job.status)) {
+          throw new Error(`video job ${job.status}: ${job.error || 'no error detail'}`);
+        }
+        if (Date.now() > deadline) {
+          throw new Error(`video job timed out after ${Math.round(timeoutMs / 1000)}s (last status: ${job.status || 'unknown'})`);
+        }
+        await sleep(pollIntervalMs);
+        const pollRes = await providerFetch(provider, pollingUrl, { method: 'GET' });
+        job = await pollRes.json();
+      }
+
+      const downloadPath = job.unsigned_urls?.[0] || `/videos/${jobId}/content?index=0`;
+      const videoRes = await providerFetch(provider, downloadPath, { method: 'GET', timeoutMs: 180000 });
+      const buffer = Buffer.from(await videoRes.arrayBuffer());
+      const latencyMs = Date.now() - startedAt;
+
+      logAttempt({
+        source,
+        kind,
+        provider_id: provider.id,
+        provider_name: provider.name,
+        model: provider.model,
+        fallback_index: index,
+        attempt: 0,
+        success: 1,
+        latency_ms: latencyMs,
+        status_code: 200,
+      });
+
+      return {
+        buffer,
+        provider: provider.name,
+        model: provider.model,
+        fallback_index: index,
+        latencyMs,
+        jobId,
+        cost: job.usage?.cost ?? null,
+      };
+    } catch (error) {
+      lastError = error;
+      logAttempt({
+        source,
+        kind,
+        provider_id: provider.id,
+        provider_name: provider.name,
+        model: provider.model,
+        fallback_index: index,
+        attempt: 0,
+        success: 0,
+        latency_ms: Date.now() - startedAt,
+        status_code: error.status ?? null,
+        error: error.message,
+      });
+    }
+  }
+
+  throw new Error(
+    `All ${providers.length} video provider(s) failed. Last error: ${lastError?.message || 'unknown error'}`
+  );
+}
+
 // ---------------------------------------------------------------- testing
 
 export async function testProvider(id, capability = 'chat') {
@@ -804,6 +958,18 @@ export async function testProvider(id, capability = 'chat') {
       });
       return { ok: false, capability: 'tts', provider: provider.name, model, latency_ms: Date.now() - startedAt, error: error.message };
     }
+  }
+
+  if (capability === 'video') {
+    // A real test would generate a paid video; direct users to DiCaprio.
+    return {
+      ok: false,
+      capability: 'video',
+      provider: provider.name,
+      model: provider.model,
+      latency_ms: 0,
+      error: 'Uji video tidak tersedia dari halaman (berbiaya per detik). Uji lewat DiCaprio → Animate Image.',
+    };
   }
 
   if (capability === 'transcription') {

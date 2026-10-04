@@ -31,7 +31,7 @@ interface LlmProvider {
 
 type ChatContent = string | Array<string | { text?: string }>;
 
-const LLM_REQUEST_MAX_TOKENS = 1500;
+const LLM_REQUEST_MAX_TOKENS = 3000;
 
 const FFMPEG_SYSTEM_PROMPT = `You are a video editing AI assistant that helps users edit their videos using FFmpeg commands.
 
@@ -274,14 +274,17 @@ interface FFmpegCommandResult {
 }
 
 function parseFFmpegResponse(responseText: string): FFmpegCommandResult {
-  try {
-    return JSON.parse(responseText);
-  } catch {
-    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-    return jsonMatch
-      ? JSON.parse(jsonMatch[0])
-      : { command: "", explanation: "Failed to parse response" };
-  }
+  const tryParse = (text: string): FFmpegCommandResult | null => {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  };
+  const embedded = responseText.match(/\{[\s\S]*\}/);
+  const parsed = tryParse(responseText) ?? (embedded ? tryParse(embedded[0]) : null);
+  if (parsed?.command) return parsed;
+  throw new Error("The AI did not return a usable FFmpeg command. Try rephrasing your request.");
 }
 
 // In-memory store for pending requests (dev only)

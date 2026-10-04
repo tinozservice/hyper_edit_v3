@@ -9,6 +9,7 @@ import AIPromptPanel from '@/react-app/components/AIPromptPanel';
 import DiCaprioPanel from '@/react-app/components/DiCaprioPanel';
 import CreatorOSPanel from '@/react-app/components/CreatorOSPanel';
 import ShortsPanel from '@/react-app/components/ShortsPanel';
+import YouTubePanel from '@/react-app/components/YouTubePanel';
 import ObsidianPanel from '@/react-app/components/ObsidianPanel';
 import GifSearchPanel from '@/react-app/components/GifSearchPanel';
 import ResizablePanel from '@/react-app/components/ResizablePanel';
@@ -18,7 +19,7 @@ import AspectRatioPicker from '@/react-app/components/AspectRatioPicker';
 import { formatSizeLabel, normalizeDimension } from '@/react-app/lib/videoFormats';
 import { useProject, Asset, TimelineClip, CaptionStyle } from '@/react-app/hooks/useProject';
 import { useVideoSession } from '@/react-app/hooks/useVideoSession';
-import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Film, Rocket, Scissors, Database, Settings } from 'lucide-react';
+import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Film, Rocket, Scissors, Database, Settings, Youtube, Save, FolderOpen, Trash2, Loader2 } from 'lucide-react';
 import type { TemplateId } from '@/remotion/templates';
 import { SIZE_TO_SCALE, POSITION_TO_OFFSET, formatTime, type DirectorTimelineOp, type VaultPlacement, type TrackId } from '@/react-app/lib/directorOps';
 
@@ -40,8 +41,26 @@ export default function Home() {
   const [aspectRatio, setAspectRatio] = useState<string>('16:9');
   const [showRatioPicker, setShowRatioPicker] = useState(false);
   const [autoSnap, setAutoSnap] = useState(true); // Ripple delete mode - shift clips when deleting
-  const [activeAgent, setActiveAgent] = useState<'director' | 'obsidian' | 'dicaprio' | 'creatoros' | 'shorts'>('director');
+  const [activeAgent, setActiveAgent] = useState<'director' | 'obsidian' | 'dicaprio' | 'creatoros' | 'shorts' | 'youtube'>('director');
   const [showGifSearch, setShowGifSearch] = useState(false);
+
+  // Saved projects (Save Project / Open Project)
+  interface SavedProject {
+    id: string;
+    name: string;
+    sessionId: string;
+    createdAt: number;
+    updatedAt: number;
+    lastOpenedAt: number | null;
+    assetCount: number;
+    clipCount: number;
+    duration: number;
+    width: number;
+    height: number;
+  }
+  const [showProjects, setShowProjects] = useState(false);
+  const [projects, setProjects] = useState<SavedProject[]>([]);
+  const [projectBusy, setProjectBusy] = useState<string | null>(null);
 
   const videoPreviewRef = useRef<VideoPreviewHandle>(null);
   const playbackRef = useRef<number | null>(null);
@@ -66,13 +85,17 @@ export default function Home() {
     moveClip,
     splitClip,
     saveProject,
+    flushProjectSave,
     loadProject,
+    openProjectSession,
     renderProject,
     getDuration,
     ensureSession,
     // Captions
+    addCaptionClip,
     addCaptionClipsBatch,
     updateCaptionStyle,
+    updateCaptionText,
     getCaptionData,
     // Timeline tabs
     timelineTabs,
@@ -130,7 +153,8 @@ export default function Home() {
       const asset = assets.find(a => a.id === previewAssetId);
       // Use asset.streamUrl which has cache-busting timestamp
       const url = asset?.streamUrl || (asset ? getAssetStreamUrl(previewAssetId) : null);
-      if (asset && url) {
+      // Text notes have no visual preview.
+      if (asset && url && asset.type !== 'text') {
         return [{
           id: 'preview-' + previewAssetId,
           url,
@@ -170,7 +194,8 @@ export default function Home() {
         const asset = assets.find(a => a.id === clip.assetId);
         // Use asset.streamUrl which has cache-busting timestamp from refreshAssets
         const url = asset?.streamUrl || (asset ? getAssetStreamUrl(asset.id) : null);
-        if (asset && url) {
+        // Text notes are never timeline media.
+        if (asset && url && asset.type !== 'text') {
           // Calculate the time within the clip (accounting for in-point)
           const clipTime = (currentTime - clip.start) + (clip.inPoint || 0);
           layers.push({
@@ -348,6 +373,13 @@ export default function Home() {
 
   // Handle dropping asset onto timeline
   const handleDropAsset = useCallback((asset: Asset, trackId: string, time: number) => {
+    // Text notes are context/instructions for Director JEV, not timeline
+    // media — attach them in the Director chat instead.
+    if (asset.type === 'text') {
+      console.warn('[Assets] Text notes cannot be placed on the timeline; attach them in the Director chat.');
+      return;
+    }
+
     // Determine which track to use based on asset type
     let targetTrackId = trackId;
 
@@ -485,12 +517,106 @@ export default function Home() {
     saveProject();
   }, [clips, currentTime, splitClip, saveProject]);
 
-  // Handle adding text overlay
+  // Handle adding text overlay: create a text clip on T1 at the playhead and
+  // select it so the properties panel opens with the text editor.
+  // Captions live on the main timeline, so leave any edit tab first.
   const handleAddText = useCallback(() => {
-    // Create a text clip on T1 track at current playhead
-    // TODO: Open text editor modal or add default text
-    console.log('Add text overlay at', currentTime);
-  }, [currentTime]);
+    if (activeTabId !== 'main') switchTimelineTab('main');
+    const duration = 3;
+    const clip = addCaptionClip(
+      [{ text: 'Teks baru', start: 0, end: duration }],
+      currentTime,
+      duration,
+      { animation: 'none', position: 'bottom', fontSize: 64 }
+    );
+    setSelectedClipId(clip.id);
+    saveProject();
+  }, [activeTabId, switchTimelineTab, currentTime, addCaptionClip, saveProject]);
+
+  // Update the text of the selected manual text overlay
+  const handleUpdateCaptionText = useCallback((clipId: string, text: string) => {
+    updateCaptionText(clipId, text);
+    saveProject();
+  }, [updateCaptionText, saveProject]);
+
+  // ---- Saved projects (Save Project / Open Project) --------------------
+  const refreshProjects = useCallback(async () => {
+    try {
+      const res = await fetch('http://localhost:3333/projects');
+      const data = await res.json();
+      if (res.ok) setProjects(data.projects || []);
+    } catch (error) {
+      console.error('[Projects] Failed to list:', error);
+    }
+  }, []);
+
+  const handleSaveProjectAs = useCallback(async () => {
+    if (!session?.sessionId) {
+      alert('Belum ada sesi aktif. Upload minimal satu media dulu.');
+      return;
+    }
+    const name = window.prompt('Nama projek:', `Projek ${new Date().toLocaleString('id-ID')}`);
+    if (!name) return;
+    setProjectBusy('save');
+    try {
+      // Flush project.json (clips/captions/settings) before snapshotting.
+      await flushProjectSave();
+      const res = await fetch('http://localhost:3333/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: session.sessionId, name }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Gagal menyimpan projek');
+      await refreshProjects();
+      alert(`Projek "${data.project.name}" tersimpan.`);
+    } catch (error) {
+      alert(`Gagal menyimpan projek: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      setProjectBusy(null);
+    }
+  }, [session, flushProjectSave, refreshProjects]);
+
+  const handleShowProjects = useCallback(async () => {
+    await refreshProjects();
+    setShowProjects(true);
+  }, [refreshProjects]);
+
+  const handleOpenProject = useCallback(async (project: SavedProject) => {
+    setProjectBusy(project.id);
+    try {
+      const res = await fetch(`http://localhost:3333/projects/${project.id}/open`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Gagal membuka projek');
+      await openProjectSession(data.sessionId);
+      setSelectedClipId(null);
+      setPreviewAssetId(null);
+      setCurrentTime(0);
+      setShowProjects(false);
+      console.log('[Projects] Opened:', data.project);
+    } catch (error) {
+      alert(`Gagal membuka projek: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      setProjectBusy(null);
+    }
+  }, [openProjectSession]);
+
+  const handleDeleteProject = useCallback(async (project: SavedProject) => {
+    if (!window.confirm(`Hapus projek "${project.name}" dari daftar?\n\nMedia hasil AI tetap aman di Media-AI; upload di folder sesi bisa ikut terhapus.`)) return;
+    setProjectBusy(project.id);
+    try {
+      const res = await fetch(`http://localhost:3333/projects/${project.id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || 'Gagal menghapus projek');
+      }
+      await refreshProjects();
+    } catch (error) {
+      alert(`Gagal menghapus projek: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      setProjectBusy(null);
+    }
+  }, [refreshProjects]);
 
   // Buka dialog rasio video (preset + custom piksel)
   const handleOpenRatioPicker = useCallback(() => {
@@ -1270,6 +1396,32 @@ export default function Home() {
     }
   }, [session, currentTime, addClip, saveProject, refreshAssets, getDuration, switchTimelineTab, clips, assets, settings.width, settings.height, settings.fps]);
 
+  // Turn an attached image into an AI video (DiCaprio Animate Image via the
+  // fallback Video provider) and add the result to the timeline.
+  const handleAnimateImage = useCallback(async (prompt: string, imageAssetId: string) => {
+    if (!session?.sessionId) {
+      throw new Error('Please upload an image first to start a session');
+    }
+
+    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/generate-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt, imageAssetId }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Failed to generate video');
+
+    await refreshAssets();
+    const duration = data.video?.duration || 5;
+    addClip(data.video.id, 'V2', currentTime, duration);
+    switchTimelineTab('main');
+    await saveProject();
+
+    console.log('Image animated into video:', data.video);
+    return { assetId: data.video.id as string, duration };
+  }, [session, refreshAssets, addClip, currentTime, saveProject, switchTimelineTab]);
+
   // Handle analyzing video for animation (returns concept for approval)
   const handleAnalyzeForAnimation = useCallback(async (request: {
     type: 'intro' | 'outro' | 'transition' | 'highlight';
@@ -1941,6 +2093,24 @@ export default function Home() {
           {(session || legacySession) && (
             <>
               <button
+                onClick={() => void handleSaveProjectAs()}
+                disabled={isProcessing || projectBusy === 'save' || !session}
+                className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
+                title="Simpan sesi ini sebagai projek yang bisa dibuka kembali"
+              >
+                {projectBusy === 'save' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                Simpan Projek
+              </button>
+              <button
+                onClick={() => void handleShowProjects()}
+                disabled={isProcessing}
+                className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
+                title="Buka projek yang tersimpan"
+              >
+                <FolderOpen className="w-4 h-4" />
+                Buka Projek
+              </button>
+              <button
                 onClick={handleGenerateChapters}
                 disabled={isProcessing || !legacySession}
                 className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
@@ -2092,6 +2262,7 @@ export default function Home() {
                   <CaptionPropertiesPanel
                     captionData={selectedCaptionData}
                     onUpdateStyle={(styleUpdates) => handleUpdateCaptionStyle(selectedClipId, styleUpdates)}
+                    onUpdateText={(text) => handleUpdateCaptionText(selectedClipId, text)}
                     onClose={() => setSelectedClipId(null)}
                   />
                 ) : (
@@ -2198,11 +2369,11 @@ export default function Home() {
           side="right"
         >
           <div className="h-full flex flex-col bg-zinc-900/80 backdrop-blur-sm">
-            {/* Agent Tabs — order: Director, Obsidian, DiCaprio, Creator OS, Shorts */}
-            <div className="flex items-center border-b border-zinc-800/50">
+            {/* Agent Tabs — order: Director, Obsidian, DiCaprio, Creator OS, Shorts, YouTube */}
+            <div className="flex items-center border-b border-zinc-800/50 overflow-x-auto">
               <button
                 onClick={() => setActiveAgent('director')}
-                className={`flex-1 flex items-center justify-center gap-1 px-1.5 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
+                className={`flex-1 flex items-center justify-center gap-1 px-2 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
                   activeAgent === 'director'
                     ? 'text-zinc-200 border-b-2 border-zinc-300 bg-zinc-800/30'
                     : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
@@ -2255,6 +2426,17 @@ export default function Home() {
                 <Scissors className="w-3.5 h-3.5" />
                 Shorts
               </button>
+              <button
+                onClick={() => setActiveAgent('youtube')}
+                className={`flex-1 flex items-center justify-center gap-1 px-1.5 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
+                  activeAgent === 'youtube'
+                    ? 'text-zinc-200 border-b-2 border-zinc-300 bg-zinc-800/30'
+                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
+                }`}
+              >
+                <Youtube className="w-3.5 h-3.5" />
+                YouTube
+              </button>
             </div>
 
             {/* AI Chat Panels - both mounted to preserve state, hidden via CSS */}
@@ -2278,6 +2460,7 @@ export default function Home() {
                   onCreateContextualAnimation={handleCreateContextualAnimation}
                   onOpenAnimationInTab={handleOpenAnimationInTab}
                   onEditAnimation={handleEditAnimation}
+                  onAnimateImage={handleAnimateImage}
                   onTimelineOp={executeDirectorTimelineOp}
                   onPlaceVaultMedia={placeVaultMedia}
                   isApplying={isProcessing}
@@ -2318,6 +2501,9 @@ export default function Home() {
                   onRefreshAssets={refreshAssets}
                 />
               </div>
+              <div className={`absolute inset-0 ${activeAgent === 'youtube' ? '' : 'hidden'}`}>
+                <YouTubePanel sessionId={session?.sessionId ?? null} assets={assets} />
+              </div>
             </div>
           </div>
         </ResizablePanel>
@@ -2340,6 +2526,83 @@ export default function Home() {
         onClose={() => setShowRatioPicker(false)}
         onApply={handleApplyVideoFormat}
       />
+
+      {/* Saved Projects Modal */}
+      {showProjects && (
+        <div
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+          onClick={() => setShowProjects(false)}
+        >
+          <div
+            className="bg-zinc-900 rounded-xl border border-zinc-700 w-full max-w-xl max-h-[85vh] overflow-hidden flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between p-4 border-b border-zinc-700">
+              <h2 className="text-lg font-semibold flex items-center gap-2">
+                <FolderOpen className="w-5 h-5 text-zinc-400" />
+                Buka Projek
+              </h2>
+              <button onClick={() => setShowProjects(false)} className="p-1 hover:bg-zinc-700 rounded transition-colors">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-4 overflow-y-auto flex-1 space-y-2">
+              {projects.length === 0 ? (
+                <div className="text-center text-sm text-zinc-500 py-8">
+                  Belum ada projek tersimpan. Klik <span className="text-zinc-300">Simpan Projek</span> di header untuk
+                  menyimpan sesi saat ini.
+                </div>
+              ) : (
+                projects.map((project) => (
+                  <div
+                    key={project.id}
+                    className={`flex items-center justify-between gap-3 p-3 rounded-lg border transition-colors ${
+                      project.sessionId === session?.sessionId
+                        ? 'border-zinc-500 bg-zinc-800/60'
+                        : 'border-zinc-700 bg-zinc-800/40 hover:bg-zinc-800/70'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium text-zinc-100 truncate flex items-center gap-2">
+                        {project.name}
+                        {project.sessionId === session?.sessionId && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-300">aktif</span>
+                        )}
+                      </div>
+                      <div className="text-[11px] text-zinc-500">
+                        {new Date(project.updatedAt).toLocaleString('id-ID')} · {project.assetCount} asset ·{' '}
+                        {project.clipCount} klip · {project.width}×{project.height}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        onClick={() => void handleOpenProject(project)}
+                        disabled={projectBusy === project.id}
+                        className="px-3 py-1.5 bg-zinc-600 hover:bg-zinc-500 disabled:opacity-50 rounded text-xs font-medium flex items-center gap-1.5"
+                      >
+                        {projectBusy === project.id ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <FolderOpen className="w-3.5 h-3.5" />
+                        )}
+                        Buka
+                      </button>
+                      <button
+                        onClick={() => void handleDeleteProject(project)}
+                        disabled={projectBusy === project.id}
+                        className="p-1.5 bg-zinc-800 hover:bg-red-900/60 disabled:opacity-50 rounded text-xs"
+                        title="Hapus dari daftar"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -22,10 +22,28 @@ OPENAI_API_KEY=
 # OPENAI_BASE_URL=https://api.openai.com/v1
 # OPENAI_CHAT_MODEL=gpt-4o-mini
 
-# --- Multimodal Gemini (analisis video/transkrip, generator animasi) ---
+# --- Multimodal Gemini (hanya untuk input audio/gambar) ---
+# Dipakai sebagai cadangan transkripsi, pembuatan gambar B-roll, dan bab dari
+# audio. Fitur teks (animasi, analisis transkrip) memakai pool fallback di
+# /settings/llm — GEMINI_API_KEY tidak wajib bila pool sudah punya provider Chat.
 GEMINI_API_KEY=
 
+# --- Media library (opsional) ---
+# Media hasil generate AI (gambar/video/audio/animasi Remotion) dipindahkan ke
+# folder ini, disortir per tanggal (YYYY-MM-DD), supaya tidak ikut terhapus
+# saat session dihapus / dibersihkan. Upload pengguna tetap di folder sesi.
+# Default: D:\Project\Shorts\Media-AI
+# MEDIA_LIBRARY_DIR=D:\Project\Shorts\Media-AI
+
 # --- Media & suara ---
+# FFmpeg/FFprobe dicari otomatis (PATH, winget, C:\ffmpeg\bin, Chocolatey,
+# Scoop). Isi ini hanya bila binary ada di lokasi lain:
+# FFMPEG_PATH=C:\path\to\ffmpeg.exe
+# FFPROBE_PATH=C:\path\to\ffprobe.exe
+
+# FAL opsional bila DiCaprio Animate Image memakai provider "Video" di
+# /settings/llm (mis. OpenRouter heygen/heygen-video-1). Restyle Video dan
+# Remove Background tetap butuh FAL_API_KEY.
 FAL_API_KEY=
 GIPHY_API_KEY=
 
@@ -35,6 +53,15 @@ GIPHY_API_KEY=
 # Model TTS (default tts-1, dengan instructions: gpt-4o-mini-tts)
 # TTS_MODEL=tts-1
 # DIRECTOR_TTS_VOICE=onyx
+
+# --- YouTube (upload native, tanpa CreatorOS) ---
+# Buat OAuth client di Google Cloud Console (lihat obsidian/Panduan Upload YouTube.md):
+# 1. Aktifkan "YouTube Data API v3"
+# 2. Buat OAuth client type "Web application"
+# 3. Tambahkan redirect URI: http://localhost:3333/youtube/oauth/callback
+YOUTUBE_CLIENT_ID=
+YOUTUBE_CLIENT_SECRET=
+# YOUTUBE_REDIRECT_URI=http://localhost:3333/youtube/oauth/callback
 
 # --- Jev (System One) ---
 # Rekomendasi: lewat OpenRouter (tanpa akun TypeSafe). Endpoint otomatis:
@@ -48,9 +75,12 @@ OPENROUTER_API_KEY=
 # Fallback lama: TypeSafe langsung (dipakai hanya bila OPENROUTER_API_KEY kosong)
 TYPESAFE_API_KEY=
 
-# Path vault Obsidian milik agen media (opsional; default macOS — di Windows
-# agen media tidak berfungsi kecuali diarahkan ke vault lokal)
-# OBSIDIAN_VAULT_PATH=
+# Path vault Obsidian milik agen media. Di Windows agen berjalan dalam mode
+# "direct" (tanpa rsync) — arahkan ke folder vault lokal berisi media +
+# sidecar .md. Kosongkan untuk memakai path default (macOS, tidak ada di Windows).
+# OBSIDIAN_VAULT_PATH=D:\Media\Vault
+# Paksa mode baca: 1 = langsung (tanpa rsync), 0 = mirror rsync (macOS)
+# OBSIDIAN_VAULT_DIRECT=
 
 # Daftar fallback lengkap khusus Worker (production), format JSON:
 # LLM_FALLBACKS=[{"name":"OpenAI","base_url":"https://api.openai.com/v1","api_key":"sk-...","model":"gpt-4o-mini"}]

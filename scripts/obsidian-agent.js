@@ -15,7 +15,7 @@
 import { readFileSync, existsSync, readdirSync, statSync, mkdirSync } from 'fs';
 import { join, relative, extname, basename, dirname } from 'path';
 import { homedir } from 'os';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { askJev, jevConfigured, jevInfo, noul } from './jev.js';
 
 const DEFAULT_VAULT_PATH =
@@ -43,6 +43,34 @@ const MIRROR_ROOT = join(homedir(), '.clipwise', 'vault-mirror');
 const MIRROR_REFRESH_MS = 5 * 60_000;
 const mirrorState = { syncing: false, lastStartedAt: 0, lastFinishedAt: 0, lastError: '', lastExitCode: null };
 
+// Direct mode: read the vault in place. Used when rsync is unavailable
+// (Windows) and for local vaults that are not iCloud-evicted. The original
+// rsync mirror stays the default on macOS, where the vault lives in iCloud
+// and files can be evicted mid-read. Force either mode with
+// OBSIDIAN_VAULT_DIRECT=1 (direct) / =0 (mirror).
+function rsyncAvailable() {
+  try {
+    const probe = spawnSync('rsync', ['--version'], { stdio: 'ignore' });
+    return !probe.error && probe.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+let directModeCache = null;
+export function useDirectVault() {
+  const override = process.env.OBSIDIAN_VAULT_DIRECT?.trim();
+  if (override === '1') return true;
+  if (override === '0') return false;
+  if (directModeCache === null) directModeCache = !rsyncAvailable();
+  return directModeCache;
+}
+
+/** Root folder every read (index, thumbnails, imports) uses. */
+export function getReadRoot() {
+  return useDirectVault() ? getVaultPath() : getMirrorPath();
+}
+
 export function getMirrorPath() {
   const vault = getVaultPath();
   const name = basename(vault.replace(/\/+$/, '')) || 'vault';
@@ -52,6 +80,17 @@ export function getMirrorPath() {
 /** Kick off (or skip, if fresh/running) an rsync of the vault into the mirror. Never blocks. */
 export function syncMirror({ force = false } = {}) {
   const vault = getVaultPath();
+
+  if (useDirectVault()) {
+    // No mirror needed — the vault is read in place. A missing vault is
+    // reported through the status (vaultExists), not as a sync error.
+    mirrorState.syncing = false;
+    mirrorState.lastFinishedAt = Date.now();
+    mirrorState.lastExitCode = existsSync(vault) ? 0 : null;
+    mirrorState.lastError = '';
+    return false;
+  }
+
   const mirror = getMirrorPath();
   if (mirrorState.syncing) return false;
   if (!force && Date.now() - mirrorState.lastFinishedAt < MIRROR_REFRESH_MS) return false;
@@ -83,7 +122,14 @@ export function syncMirror({ force = false } = {}) {
 }
 
 export function getMirrorState() {
-  return { ...mirrorState, mirrorPath: getMirrorPath(), mirrorExists: existsSync(getMirrorPath()) };
+  const direct = useDirectVault();
+  const readRoot = direct ? getVaultPath() : getMirrorPath();
+  return {
+    ...mirrorState,
+    mode: direct ? 'direct' : 'mirror',
+    mirrorPath: readRoot,
+    mirrorExists: existsSync(readRoot),
+  };
 }
 
 // ---------- frontmatter ----------
@@ -137,7 +183,7 @@ function walk(dir, out = []) {
 
 export function loadIndex({ force = false } = {}) {
   syncMirror(); // background refresh when stale; no-op if running or fresh
-  const vault = getMirrorPath();
+  const vault = getReadRoot();
   const fresh = cache.vault === vault && Date.now() - cache.builtAt < CACHE_TTL_MS;
   if (fresh && !force) return cache.items;
 
@@ -204,7 +250,7 @@ export function getObsidianStatus() {
   return {
     vaultPath: vault,
     vaultExists: exists,
-    mirror: { path: mirror.mirrorPath, exists: mirror.mirrorExists, syncing: mirror.syncing, lastSyncedAt: mirror.lastFinishedAt || null, error: mirror.lastError || null },
+    mirror: { mode: mirror.mode, path: mirror.mirrorPath, exists: mirror.mirrorExists, syncing: mirror.syncing, lastSyncedAt: mirror.lastFinishedAt || null, error: mirror.lastError || null },
     itemCount: items.length,
     videos: items.filter((i) => i.type === 'video').length,
     images: items.filter((i) => i.type === 'image').length,
@@ -337,7 +383,7 @@ function familyFor(items, brand) {
 }
 
 function toRow(item) {
-  const poster = item.posterPath ? relative(getMirrorPath(), item.posterPath) : '';
+  const poster = item.posterPath ? relative(getReadRoot(), item.posterPath) : '';
   return {
     id: item.id,
     name: item.name,

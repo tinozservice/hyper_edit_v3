@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move, Mic, Headphones, Square } from 'lucide-react';
+import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move, Mic, Headphones, Square, FileText } from 'lucide-react';
 import { useVoiceDirector } from '@/react-app/hooks/useVoiceDirector';
 import { formatTime as fmtTime, type DirectorTimelineOp, type VaultPlacement } from '@/react-app/lib/directorOps';
 import type { TimelineClip, Track, Asset } from '@/react-app/hooks/useProject';
@@ -16,11 +16,11 @@ interface TimelineReference {
   timestamp?: number;
 }
 
-// Attached asset for animation creation
+// Attached asset for animation creation (text = note/instructions for JEV)
 interface AttachedAsset {
   id: string;
   filename: string;
-  type: 'image' | 'video';
+  type: 'image' | 'video' | 'text';
   thumbnailUrl?: string | null;
 }
 
@@ -161,7 +161,7 @@ interface ClarifyingQuestion {
 interface EditTabV1Context {
   assetId: string;
   filename: string;
-  type: 'video' | 'image' | 'audio';
+  type: 'video' | 'image' | 'audio' | 'text';
   duration?: number;
   aiGenerated?: boolean; // True if this is a Remotion-generated animation
 }
@@ -184,6 +184,8 @@ interface AIPromptPanelProps {
   onExtractAudio?: () => Promise<ExtractAudioResult>;
   onOpenAnimationInTab?: (assetId: string, animationName: string) => string | undefined;
   onEditAnimation?: (assetId: string, editPrompt: string, v1Context?: EditTabV1Context, tabIdToUpdate?: string) => Promise<{ assetId: string; duration: number; sceneCount: number }>;
+  // Animate an attached image into an AI video (DiCaprio / image-to-video)
+  onAnimateImage?: (prompt: string, imageAssetId: string) => Promise<{ assetId: string; duration: number }>;
   // Timeline arrangement (delete/split/move/trim/scale/position/seek/play) decided by Jev, executed in Home
   onTimelineOp?: (op: DirectorTimelineOp, prompt: string) => Promise<string>;
   // Vault media: ask Jev the media agent, import, and place on the timeline
@@ -222,6 +224,7 @@ export default function AIPromptPanel({
   onExtractAudio,
   onOpenAnimationInTab,
   onEditAnimation,
+  onAnimateImage,
   onTimelineOp,
   onPlaceVaultMedia,
   isApplying,
@@ -389,16 +392,17 @@ export default function AIPromptPanel({
   const addReference = (ref: TimelineReference) => {
     setShowReferencePicker(false);
 
-    // For image/video assets, add as attachment for Remotion animations instead of reference
+    // For image/video/text assets, add as attachment (text notes are context
+    // for Director JEV) instead of a timeline reference.
     if (ref.type === 'clip') {
       const asset = assets.find(a => a.id === ref.id);
-      if (asset && (asset.type === 'image' || asset.type === 'video')) {
+      if (asset && (asset.type === 'image' || asset.type === 'video' || asset.type === 'text')) {
         // Don't add duplicate attachments
         if (!attachedAssets.some(a => a.id === asset.id)) {
           setAttachedAssets(prev => [...prev, {
             id: asset.id,
             filename: asset.filename,
-            type: asset.type as 'image' | 'video',
+            type: asset.type as 'image' | 'video' | 'text',
             thumbnailUrl: asset.thumbnailUrl,
           }]);
         }
@@ -424,7 +428,7 @@ export default function AIPromptPanel({
     }
   };
 
-  // Handle file attachment for animations
+  // Handle file attachment for animations and Director notes
   const handleFileAttachment = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0 || !onUploadAttachment) return;
@@ -432,18 +436,19 @@ export default function AIPromptPanel({
     setIsUploadingAttachment(true);
     try {
       for (const file of Array.from(files)) {
-        // Only allow images and videos
-        if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) {
-          console.warn('Skipping non-image/video file:', file.name);
+        // Images/videos for animation, .txt/.md as notes/instructions for JEV
+        const isTextFile = file.type.startsWith('text/') || /\.(txt|md|markdown)$/i.test(file.name);
+        if (!file.type.startsWith('image/') && !file.type.startsWith('video/') && !isTextFile) {
+          console.warn('Skipping unsupported file:', file.name);
           continue;
         }
 
         const asset = await onUploadAttachment(file);
-        if (asset && (asset.type === 'image' || asset.type === 'video')) {
+        if (asset && (asset.type === 'image' || asset.type === 'video' || asset.type === 'text')) {
           setAttachedAssets(prev => [...prev, {
             id: asset.id,
             filename: asset.filename,
-            type: asset.type as 'image' | 'video',
+            type: asset.type as 'image' | 'video' | 'text',
             thumbnailUrl: asset.thumbnailUrl,
           }]);
         }
@@ -498,8 +503,8 @@ export default function AIPromptPanel({
 
     try {
       const asset = JSON.parse(assetData);
-      // Only accept images and GIFs (which are also type 'image')
-      if (asset.type === 'image') {
+      // Accept images/videos (animations) and text notes (Director context)
+      if (asset.type === 'image' || asset.type === 'video' || asset.type === 'text') {
         // Check if already attached
         if (attachedAssets.some(a => a.id === asset.id)) {
           console.log('Asset already attached:', asset.filename);
@@ -508,12 +513,12 @@ export default function AIPromptPanel({
         setAttachedAssets(prev => [...prev, {
           id: asset.id,
           filename: asset.filename,
-          type: asset.type as 'image' | 'video',
+          type: asset.type as 'image' | 'video' | 'text',
           thumbnailUrl: asset.thumbnailUrl,
         }]);
         console.log('Asset attached from drag:', asset.filename);
       } else {
-        console.log('Only images/GIFs can be dropped here. Got:', asset.type);
+        console.log('Only images/videos/notes can be dropped here. Got:', asset.type);
       }
     } catch (err) {
       console.error('Failed to parse dropped asset:', err);
@@ -542,6 +547,27 @@ export default function AIPromptPanel({
 
     if (parts.length === 0) return '';
     return parts.join(' ') + '\n\n';
+  };
+
+  // Read attached .txt/.md notes and turn them into prompt context /
+  // instructions for Director JEV (capped per note to keep prompts sane).
+  const buildNoteContext = async (): Promise<string> => {
+    const notes = attachedAssets.filter(a => a.type === 'text');
+    if (notes.length === 0) return '';
+    const parts: string[] = [];
+    for (const note of notes) {
+      const asset = assets.find(a => a.id === note.id);
+      if (!asset?.streamUrl) continue;
+      try {
+        const res = await fetch(asset.streamUrl);
+        if (!res.ok) continue;
+        const content = (await res.text()).slice(0, 6000).trim();
+        if (content) parts.push(`[Attached note: ${note.filename}]\n${content}\n[End of note]`);
+      } catch (error) {
+        console.error('Failed to read attached note:', error);
+      }
+    }
+    return parts.join('\n\n');
   };
 
   const FONT_OPTIONS = [
@@ -899,6 +925,7 @@ export default function AIPromptPanel({
     | 'transcript-animation' // Kinetic typography from speech
     | 'contextual-animation' // Animation based on video content
     | 'extract-audio'       // Extract audio to separate track
+    | 'animate-image'       // Turn an attached image into an AI video (image-to-video)
     | 'ffmpeg-edit'         // Direct FFmpeg video manipulation
     | 'timeline-op'         // Arrange clips / playback without re-encoding (Jev-filled op)
     | 'vault-media'         // Pull a logo / clip from the vault onto the timeline
@@ -913,6 +940,9 @@ export default function AIPromptPanel({
     hasTimeRange: boolean;
     timeRangeStart?: number;
     timeRangeEnd?: number;
+    // Attached images/videos in the chat input
+    hasAttachedImage: boolean;
+    attachedImageId?: string;
     // Info about AI-generated animations on the main timeline
     hasAiAnimationsOnTimeline: boolean;
     selectedClipIsAiAnimation: boolean;
@@ -1067,6 +1097,20 @@ export default function AIPromptPanel({
       return 'batch-animations';
     }
 
+    // Attached image + "make it a video / animate it / move the camera" →
+    // image-to-video via DiCaprio (not a Remotion scene animation).
+    if (ctx.hasAttachedImage) {
+      const imageToVideoIntent =
+        (/\b(image|picture|photo|gambar|foto)\b/.test(lower) &&
+          /\b(video|animate|animated|animation|motion|move|moving|life|hidup)\b/.test(lower)) ||
+        /\b(kamera|camera|orbit|mengelilingi|memutar|muter)\b/.test(lower) ||
+        /(jadi|jadiin|jadikan|buat|bikin)\s+video\b/.test(lower) ||
+        /bring (it|this) to life|make (it|this) move|animate (this|it|the)/.test(lower);
+      if (imageToVideoIntent) {
+        return 'animate-image';
+      }
+    }
+
     // Create new animation (explicit creation requests)
     if ((lower.includes('create') || lower.includes('make') || lower.includes('generate') ||
          lower.includes('add') || lower.includes('build') || lower.includes('design')) &&
@@ -1151,6 +1195,7 @@ export default function AIPromptPanel({
             hasAiAnimationsOnTimeline: ctx.hasAiAnimationsOnTimeline,
             hasTimeRange: ctx.hasTimeRange,
             hasVideo: ctx.hasVideo,
+            hasAttachedImage: ctx.hasAttachedImage,
             clips: timelineClips,
             currentTime,
             selectedClipLabel: selectedLabel,
@@ -1214,33 +1259,34 @@ export default function AIPromptPanel({
   };
 
   // Poll for job completion
-  const pollForResult = async (jobId: string, maxAttempts = 60): Promise<any> => {
+  const pollForResult = async (jobId: string, maxAttempts = 60): Promise<{ status: string; command?: string; explanation?: string; error?: string }> => {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       setProcessingStatus(`AI is working... (${attempt + 1}s)`);
 
+      let data: { status: string; command?: string; explanation?: string; error?: string };
       try {
         const response = await fetch(`/api/ai-edit/status/${jobId}`);
         if (!response.ok) {
           throw new Error(`Status check failed: ${response.status}`);
         }
-
-        const data = await response.json();
-
-        if (data.status === 'complete') {
-          return data;
-        }
-
-        if (data.status === 'error') {
-          throw new Error(data.error || 'Processing failed');
-        }
-
-        // Still processing, wait and try again
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        data = await response.json();
       } catch (error) {
-        // On network error, wait and retry
+        // Network error: wait and retry the poll.
         console.error('Poll error:', error);
         await new Promise(resolve => setTimeout(resolve, 1000));
+        continue;
       }
+
+      if (data.status === 'complete') {
+        return data;
+      }
+
+      if (data.status === 'error') {
+        throw new Error(data.error || 'Processing failed');
+      }
+
+      // Still processing, wait and try again
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
     throw new Error('Request timed out after 60 seconds');
@@ -1600,7 +1646,11 @@ export default function AIPromptPanel({
 
     // Capture current attachments before clearing
     const currentAttachments = [...attachedAssets];
-    const attachedAssetIds = currentAttachments.map(a => a.id);
+    // Text notes are prompt context, not renderable media — only images and
+    // videos go to the Remotion animation generator.
+    const attachedAssetIds = currentAttachments
+      .filter(a => a.type === 'image' || a.type === 'video')
+      .map(a => a.id);
 
     try {
       const hasTimeRange = startTimeOverride !== undefined;
@@ -2027,15 +2077,19 @@ export default function AIPromptPanel({
   const handleSubmit = async (e?: React.FormEvent, overrideText?: string) => {
     e?.preventDefault();
     const rawText = (overrideText ?? prompt).trim();
-    if (!rawText) return;
+    // An attached .txt/.md note can be the instruction by itself.
+    const hasAttachedNotes = attachedAssets.some(a => a.type === 'text');
+    if (!rawText && !hasAttachedNotes) return;
 
     const referenceContext = buildReferenceContext();
-    const userMessage = rawText;
+    // Attached .txt/.md notes become context/instructions for Director JEV.
+    const noteContext = await buildNoteContext();
+    const userMessage = noteContext ? `${noteContext}\n\n${rawText}` : rawText;
     const fullMessage = referenceContext + userMessage;
 
     // Check for time range: first use UI selection, then try to parse from prompt text
     const uiTimeRange = timeRange;
-    const promptTimeRange = !uiTimeRange ? parseTimeRangeFromPrompt(userMessage) : undefined;
+    const promptTimeRange = !uiTimeRange ? parseTimeRangeFromPrompt(rawText) : undefined;
     const savedTimeRange = uiTimeRange || promptTimeRange; // Use UI selection first, then parsed from prompt
 
     setPrompt('');
@@ -2045,7 +2099,7 @@ export default function AIPromptPanel({
     // Add user message to chat (show references and time range as tags visually)
     const timePart = savedTimeRange ? `[${formatTimeShort(savedTimeRange.start)}-${formatTimeShort(savedTimeRange.end)}] ` : '';
     const refPart = selectedReferences.length > 0 ? `${selectedReferences.map(r => `@${r.label}`).join(' ')} ` : '';
-    const displayMessage = `${timePart}${refPart}${userMessage}`;
+    const displayMessage = `${timePart}${refPart}${rawText || 'Gunakan catatan terlampir sebagai perintah.'}`;
     setChatHistory((prev) => [...prev, { type: 'user', text: displayMessage }]);
 
     // ===========================================
@@ -2092,6 +2146,8 @@ export default function AIPromptPanel({
       hasTimeRange: !!savedTimeRange,
       timeRangeStart: savedTimeRange?.start,
       timeRangeEnd: savedTimeRange?.end,
+      hasAttachedImage: attachedAssets.some(a => a.type === 'image'),
+      attachedImageId: attachedAssets.find(a => a.type === 'image')?.id,
       hasAiAnimationsOnTimeline,
       selectedClipIsAiAnimation,
       selectedAiAnimationAssetId: selectedClipIsAiAnimation ? selectedClipAsset?.id : undefined,
@@ -2303,6 +2359,40 @@ export default function AIPromptPanel({
       return;
     }
 
+    // Animate an attached image into an AI video (image-to-video)
+    if (workflow === 'animate-image') {
+      const imageId = directorContext.attachedImageId;
+      if (!onAnimateImage || !imageId) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: 'Attach an image first (the paperclip button), then ask me to turn it into a video.',
+        }]);
+        return;
+      }
+      setIsProcessing(true);
+      setProcessingStatus('Generating video from image...');
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: '🎬 Turning your image into a video...\n\n1. Enhancing the motion prompt\n2. Generating the video with AI\n3. Adding it to the timeline\n\nThis may take a moment...',
+      }]);
+      try {
+        const result = await onAnimateImage(userMessage, imageId);
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: `✅ Video ready (${result.duration.toFixed(1)}s) and added to the timeline.`,
+        }]);
+      } catch (error) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: `❌ Failed to generate video: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        }]);
+      } finally {
+        setIsProcessing(false);
+        setProcessingStatus('');
+      }
+      return;
+    }
+
     // Create new animation (Remotion)
     if (workflow === 'create-animation') {
       await handleCustomAnimationWorkflow(userMessage, savedTimeRange?.start, savedTimeRange?.end);
@@ -2346,7 +2436,7 @@ export default function AIPromptPanel({
         ...prev,
         {
           type: 'assistant',
-          text: data.explanation,
+          text: data.explanation || data.command || '',
           command: data.command,
           explanation: data.explanation,
           applied: false,
@@ -2839,7 +2929,7 @@ export default function AIPromptPanel({
                 key={asset.id}
                 className="flex items-center gap-1 px-2 py-1 bg-zinc-500/20 text-zinc-300 rounded-md text-xs"
               >
-                {asset.type === 'image' ? <Image className="w-3 h-3" /> : <Film className="w-3 h-3" />}
+                {asset.type === 'image' ? <Image className="w-3 h-3" /> : asset.type === 'text' ? <FileText className="w-3 h-3" /> : <Film className="w-3 h-3" />}
                 <span className="truncate max-w-[100px]">{asset.filename}</span>
                 <button
                   type="button"
@@ -2879,7 +2969,7 @@ export default function AIPromptPanel({
                 <button
                   type="button"
                   onClick={() => setShowReferencePicker(!showReferencePicker)}
-                  disabled={!hasVideo || isProcessing}
+                  disabled={assets.length === 0 || isProcessing}
                   className={`p-1.5 rounded-md transition-all ${
                     showReferencePicker
                       ? 'bg-zinc-500/20 text-zinc-400'
@@ -2945,6 +3035,8 @@ export default function AIPromptPanel({
                                     <Music className="w-5 h-5 text-zinc-400" />
                                   ) : asset.type === 'image' ? (
                                     <Image className="w-5 h-5 text-zinc-400" />
+                                  ) : asset.type === 'text' ? (
+                                    <FileText className="w-5 h-5 text-zinc-400" />
                                   ) : (
                                     <Film className="w-5 h-5 text-zinc-400" />
                                   )}
@@ -2983,7 +3075,7 @@ export default function AIPromptPanel({
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept="image/*,video/*"
+                  accept="image/*,video/*,.txt,.md,.markdown,text/plain,text/markdown"
                   multiple
                   onChange={handleFileAttachment}
                   className="hidden"

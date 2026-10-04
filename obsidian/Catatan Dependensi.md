@@ -10,7 +10,7 @@ Terkait: [[Logs/2026-10-02 - Implementasi Fallback LLM|Log 2026-10-02]] · [[Aud
 | **Node.js ≥ 22.5** | ✅ v24.20.0 | Fitur `node:sqlite` (database pool fallback) baru tersedia sejak 22.5; proyek memakai Node 24 |
 | **npm** | ⚠️ 9.8.1 | Berfungsi, tapi `camera-controls` minta npm ≥10.5.1 (hanya warning `EBADENGINE`). Bisa di-update dengan `npm i -g npm@11` |
 | **Git** | ✅ 2.55 | |
-| **FFmpeg + FFprobe** | ❌ belum ada | **Wajib** untuk hampir semua fitur video (upload, thumbnail, render, shorts, dead-air, ekstraksi audio Whisper). Install: `winget install Gyan.FFmpeg`, lalu buka terminal baru dan cek `ffmpeg -version` |
+| **FFmpeg + FFprobe** | ✅ v9.0.2 (winget `Gyan.FFmpeg`) | **Wajib** untuk hampir semua fitur video (upload, thumbnail, render, shorts, dead-air, ekstraksi audio Whisper). Server editor otomatis mencari ffmpeg/ffprobe di `%LOCALAPPDATA%\Microsoft\WinGet\Links`, folder paket winget, `C:\ffmpeg\bin`, Chocolatey, dan Scoop — jadi terminal yang PATH-nya belum ter-refresh tetap jalan. Override manual: `FFMPEG_PATH`/`FFPROBE_PATH` di `.dev.vars` |
 | **Python + Whisper** | ❌ belum | Opsional (transkripsi lokal gratis). Butuh Python 3.11/3.12 (torch belum tentu mendukung 3.14). Lihat bawah |
 | **Chrome / Edge** | ✅ ada | Untuk mode suara (Web Speech API) dan render headless Remotion |
 | **RAM** | ⚠️ 12 GB (sisa ~3 GB) | Render Remotion + Whisper berat; tutup aplikasi lain saat render |
@@ -20,7 +20,7 @@ Terkait: [[Logs/2026-10-02 - Implementasi Fallback LLM|Log 2026-10-02]] · [[Aud
 **Tidak ada dependensi npm baru** untuk fitur fallback LLM — SQLite memakai `node:sqlite` bawaan Node.
 
 Yang sudah dipakai di jalur LLM/AI:
-- `@google/genai` — Gemini (multimodal video/transkrip, generator animasi) — belum dikonversi
+- `@google/genai` — Gemini untuk tugas multimodal saja (transkripsi audio/video cadangan, pembuatan gambar B-roll, bab dari audio). Pembuatan teks (scene animasi, analisis transkrip, peningkatan prompt) sudah lewat pool fallback
 - `@fal-ai/client` — video/image generation (DiCaprio) — belum dikonversi
 - `formdata-node` — multipart untuk endpoint `/audio/transcriptions` OpenAI-compatible
 - `openai` (Python) — bukan untuk proyek ini, hanya keliru terpasang global
@@ -51,14 +51,18 @@ Salin dari `.dev.vars.example` → `.dev.vars`:
 |---|---|---|
 | `ANTHROPIC_API_KEY` | Orkestrasi Director/DiCaprio/CreatorOS (via endpoint OpenAI-compatible Anthropic) | Untuk fitur AI |
 | `OPENAI_API_KEY` | Chat cadangan, Whisper API, TTS | Opsional |
-| `GEMINI_API_KEY` | Analisis video/transkrip, generator animasi | Untuk fitur animasi |
-| `FAL_API_KEY` | DiCaprio (video/image generation) | Untuk fitur DiCaprio |
+| `GEMINI_API_KEY` | Cadangan terakhir Gemini: transkripsi audio/video, pembuatan gambar B-roll, bab dari audio. Fitur teks (animasi, analisis) memakai pool fallback | Opsional |
+| `FAL_API_KEY` | DiCaprio: Restyle Video, Remove Background, dan Animate Image bila tidak ada provider **Video** di pool | Opsional bila provider Video aktif |
 | `GIPHY_API_KEY` | Pencarian GIF | Opsional |
 | `TYPESAFE_API_KEY` | Jev (routing Direktur + agen media) langsung ke TypeSafe — **opsional, digantikan OpenRouter** | Opsional |
 | `OPENROUTER_API_KEY` | Jev via OpenRouter (`JEV_MODEL`, default `typesafe/jev-1.13`); menang bila keduanya diisi | Opsional |
 | `JEV_MODEL` | Versi model Jev spesifik, mis. `typesafe/jev-1.13` atau alias `~typesafe/jev-latest` | Opsional |
 | `JEV_ENDPOINT` | Override endpoint Jev (default: Decisions API OpenRouter) | Opsional |
-| `OBSIDIAN_VAULT_PATH` | Vault agen media | Opsional (default macOS — tidak jalan di Windows) |
+| `YOUTUBE_CLIENT_ID` | Upload YouTube native (lihat [[Panduan Upload YouTube]]) | Untuk upload |
+| `YOUTUBE_CLIENT_SECRET` | Secret OAuth client Google | Untuk upload |
+| `YOUTUBE_REDIRECT_URI` | Redirect URI OAuth (default `http://localhost:3333/youtube/oauth/callback`) | Opsional |
+| `OBSIDIAN_VAULT_PATH` | Vault agen media. Di Windows agen berjalan mode **direct** (tanpa rsync); arahkan ke folder lokal berisi media + sidecar `.md` | Opsional |
+| `OBSIDIAN_VAULT_DIRECT` | `1` paksa baca langsung, `0` paksa mirror rsync (default: otomatis — direct bila rsync tidak ada) | Opsional |
 
 Kunci yang terisi otomatis dimasukkan ke pool fallback saat server editor pertama kali dijalankan. Setelah itu kelola lewat halaman `/settings/llm` (lihat [[Panduan Fallback LLM]]).
 
@@ -68,6 +72,15 @@ Kunci yang terisi otomatis dimasukkan ke pool fallback saat server editor pertam
 - Dibuat otomatis saat server editor pertama kali memanggil fitur LLM
 - Tabel: `llm_providers` (daftar fallback), `llm_logs` (riwayat percobaan), `llm_settings` (flag seed)
 - Mode WAL, aman diakses server + skrip sekaligus
+- `data/youtube.db` — refresh token OAuth YouTube + riwayat upload (juga gitignored)
+- `data/projects.json` + `data/projects/<id>/` — daftar **projek tersimpan** (nama, sessionId, snapshot `project.json`/`assets-meta.json`). Sesi yang disimpan di-*pin* agar tidak ikut auto-cleanup 2 jam.
+
+## Media library (hasil generate AI)
+
+- Lokasi default: `D:\Project\Shorts\Media-AI\<YYYY-MM-DD>\` (sortir per tanggal; ubah lewat `MEDIA_LIBRARY_DIR` di `.dev.vars`)
+- Hanya **media hasil generate AI** yang dipindahkan ke sini: animasi Remotion, gambar/video hasil generate, restyle, remove-bg, dan B-roll. Upload pengguna tetap di folder sesi (`%TEMP%`).
+- `assets-meta.json` menyimpan `libraryRelative`, jadi sesi bisa dipulihkan setelah restart; **menghapus session tidak menghapus media di library**.
+- Saat startup, server memigrasikan asset AI lama dari folder sesi ke library secara otomatis.
 
 ## Port
 
@@ -79,4 +92,4 @@ Kunci yang terisi otomatis dimasukkan ke pool fallback saat server editor pertam
 ## Diketahui belum beres (di luar scope permintaan ini)
 
 - **Bug Windows `spawn('npx')`** di `scripts/local-ffmpeg-server.js` (3 lokasi render Remotion) — gagal `ENOENT` di Windows; perlu `npx.cmd`/`shell: true`. Render motion graphic & animasi AI belum bisa sampai ini dipatch.
-- **Agen Obsidian (Jev)** hardcoded ke vault macOS iCloud + `rsync` — tidak berfungsi di Windows.
+- **Agen Obsidian (Jev)** kini mendukung Windows lewat mode *direct* (tanpa rsync): vault dibaca di tempat, tanpa warning `spawn rsync ENOENT`. Agar berguna, isi `OBSIDIAN_VAULT_PATH` ke vault lokal berisi media + sidecar `.md` (format Marketing OS Broll). Tanpa itu panel menampilkan "Vault not found" — bukan error rsync.

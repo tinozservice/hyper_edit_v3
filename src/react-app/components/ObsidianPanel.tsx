@@ -43,8 +43,9 @@ interface ObsidianStatus {
   videos: number;
   images: number;
   jev: boolean;
-  // The server reads a local mirror of the iCloud vault (see scripts/obsidian-agent.js)
-  mirror?: { path: string; exists: boolean; syncing: boolean; lastSyncedAt: number | null; error: string | null };
+  // 'mirror' = rsync copy of the iCloud vault (macOS default);
+  // 'direct' = vault read in place (Windows / local vaults).
+  mirror?: { mode?: 'direct' | 'mirror'; path: string; exists: boolean; syncing: boolean; lastSyncedAt: number | null; error: string | null };
 }
 
 interface ChatMessage {
@@ -236,6 +237,8 @@ export default function ObsidianPanel({ ensureSession, onRefreshAssets }: Obsidi
 
   importRef.current = handleImport;
 
+  const vaultName = status?.vaultPath?.split(/[\\/]/).filter(Boolean).pop() || 'Vault';
+
   return (
     <div className="flex flex-col h-full bg-zinc-900/80">
       {/* Header */}
@@ -253,7 +256,7 @@ export default function ObsidianPanel({ ensureSession, onRefreshAssets }: Obsidi
         </div>
         <p className="text-xs text-zinc-400">
           {status?.vaultExists
-            ? `Marketing OS Broll vault · ${status.videos} clip${status.videos === 1 ? '' : 's'}, ${status.images} image${status.images === 1 ? '' : 's'}${status.mirror?.syncing ? ' · syncing from iCloud…' : ''}`
+            ? `${vaultName} vault · ${status.videos} clip${status.videos === 1 ? '' : 's'}, ${status.images} image${status.images === 1 ? '' : 's'}${status.mirror?.syncing ? ' · syncing from iCloud…' : ''}${status.mirror?.mode === 'direct' ? ' · dibaca langsung' : ''}`
             : 'Search your media knowledge vault and pull logos, brand assets and b-roll into the editor.'}
         </p>
       </div>

@@ -5,6 +5,7 @@ import type { CaptionStyle, CaptionData } from '@/react-app/hooks/useProject';
 interface CaptionPropertiesPanelProps {
   captionData: CaptionData;
   onUpdateStyle: (styleUpdates: Partial<CaptionStyle>) => void;
+  onUpdateText?: (text: string) => void;
   onClose: () => void;
 }
 
@@ -36,9 +37,13 @@ const POSITION_OPTIONS = [
 export default function CaptionPropertiesPanel({
   captionData,
   onUpdateStyle,
+  onUpdateText,
   onClose,
 }: CaptionPropertiesPanelProps) {
   const style = captionData.style;
+  // A single word means this is a manual text overlay (not transcribed
+  // captions, which carry per-word timings), so its text can be edited.
+  const isManualText = captionData.words.length === 1;
 
   const handleFontChange = useCallback((value: string) => {
     onUpdateStyle({ fontFamily: value });
@@ -104,6 +109,20 @@ export default function CaptionPropertiesPanel({
           {captionData.words.length} words
         </div>
       </div>
+
+      {/* Text (manual text overlays only) */}
+      {isManualText && onUpdateText && (
+        <div className="px-3 py-2 border-b border-zinc-800/50">
+          <label className="text-[10px] text-zinc-500 mb-1 block">Text</label>
+          <textarea
+            value={captionData.words[0]?.text || ''}
+            onChange={(e) => onUpdateText(e.target.value)}
+            rows={2}
+            placeholder="Tulis teks…"
+            className="w-full px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-xs text-white resize-none outline-none focus:border-zinc-500"
+          />
+        </div>
+      )}
 
       {/* Properties */}
       <div className="flex-1 overflow-auto p-3 space-y-4">

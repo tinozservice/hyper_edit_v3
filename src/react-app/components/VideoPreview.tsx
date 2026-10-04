@@ -289,7 +289,12 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
   return (
     <div
       ref={containerRef}
-      className={`relative ${containerClass} bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10`}
+      // `isolate` membuat stacking context sendiri untuk kanvas. Tanpa ini,
+      // z-index layer di dalam kanvas (mis. gambar overlay `baseZIndex + 100`)
+      // ikut berkompetisi di level halaman dan bisa menutupi modal `z-50`
+      // seperti AspectRatioPicker. Dengan isolate, layer kanvas tidak akan
+      // pernah keluar di atas dialog.
+      className={`relative isolate ${containerClass} bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10`}
       style={containerStyle}
     >
       {/* Base video layer (V1) - rendered separately for stability */}
