@@ -46,7 +46,7 @@ interface DiCaprioPanelProps {
 const SKILLS = [
   { id: 'animate' as DiCaprioSkill, label: 'Animate', icon: Play, description: 'Image → Video', requiresType: 'image' },
   { id: 'restyle' as DiCaprioSkill, label: 'Restyle', icon: Wand2, description: 'Transform style', requiresType: 'video' },
-  { id: 'remove-bg' as DiCaprioSkill, label: 'Remove BG', icon: Eraser, description: 'Remove background', requiresType: 'video' },
+  { id: 'remove-bg' as DiCaprioSkill, label: 'Remove BG', icon: Eraser, description: 'Chroma key green/blue screen', requiresType: 'video' },
 ];
 
 const QUICK_ACTIONS = [
@@ -157,7 +157,12 @@ export default function DiCaprioPanel({
     if (lower.includes('animate') || lower.includes('bring to life') ||
         lower.includes('add motion') || lower.includes('make it move') ||
         lower.includes('zoom') || lower.includes('pan') ||
-        lower.includes('camera movement')) {
+        lower.includes('camera movement') ||
+        // text-to-video (no image needed)
+        lower.includes('generate video') || lower.includes('create video') ||
+        lower.includes('text to video') || lower.includes('make a video') ||
+        lower.includes('buat video') || lower.includes('bikin video') ||
+        lower.includes('buatkan video')) {
       return 'animate';
     }
 
@@ -185,6 +190,40 @@ export default function DiCaprioPanel({
       setMessages(prev => [...prev, {
         type: 'assistant',
         text: `Your animated video is ready!`,
+        video: data.video,
+      }]);
+
+      onRefreshAssets?.();
+      if (data.video?.id) onVideoGenerated?.(data.video.id);
+    } catch (error) {
+      setMessages(prev => [...prev, {
+        type: 'assistant',
+        text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      }]);
+    } finally {
+      setIsGenerating(false);
+      clearAttachment();
+    }
+  };
+
+  // Generate video from text only (text-to-video via the Video provider)
+  const generateFromText = async (videoPrompt: string) => {
+    setIsGenerating(true);
+
+    try {
+      const response = await fetch(`http://localhost:3333/session/${sessionId}/generate-video`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: videoPrompt }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Failed to generate video');
+
+      setMessages(prev => [...prev, {
+        type: 'assistant',
+        text: `Your video is ready!`,
         video: data.video,
       }]);
 
@@ -257,7 +296,7 @@ export default function DiCaprioPanel({
 
       setMessages(prev => [...prev, {
         type: 'assistant',
-        text: `Background removed! Your video now has a transparent background.`,
+        text: `Background removed with chroma key! Your video now has a transparent background (WebM/VP9 alpha).`,
         video: data.video,
       }]);
 
@@ -323,10 +362,8 @@ export default function DiCaprioPanel({
 
     if (detectedSkill === 'animate') {
       if (imageAssets.length === 0) {
-        setMessages(prev => [...prev, {
-          type: 'assistant',
-          text: "I need an image to animate! Use the + button to attach one.",
-        }]);
+        // No image attached → text-to-video through the Video provider.
+        await generateFromText(userMessage);
         return;
       }
       if (imageAssets.length === 1) {

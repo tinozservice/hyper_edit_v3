@@ -5,9 +5,11 @@ interface CaptionRendererProps {
   words: CaptionWord[];
   style: CaptionStyle;
   currentTime: number;  // Time within the caption clip
+  isSelected?: boolean;
+  onDragStart?: (e: React.MouseEvent) => void;
 }
 
-export default function CaptionRenderer({ words, style, currentTime }: CaptionRendererProps) {
+export default function CaptionRenderer({ words, style, currentTime, isSelected, onDragStart }: CaptionRendererProps) {
   // Apply time offset (negative = captions appear earlier, positive = later)
   const adjustedTime = currentTime - (style.timeOffset || 0);
 
@@ -52,11 +54,22 @@ export default function CaptionRenderer({ words, style, currentTime }: CaptionRe
         return { ...base, top: '8%' };
       case 'center':
         return { ...base, top: '50%', transform: 'translate(-50%, -50%)' };
+      case 'custom': {
+        // Free placement: positionX/positionY are percentages of the canvas.
+        const x = Math.min(100, Math.max(0, style.positionX ?? 50));
+        const y = Math.min(100, Math.max(0, style.positionY ?? 50));
+        return {
+          ...base,
+          left: `${x}%`,
+          top: `${y}%`,
+          transform: 'translate(-50%, -50%)',
+        };
+      }
       case 'bottom':
       default:
         return { ...base, bottom: '8%' };
     }
-  }, [style.position]);
+  }, [style.position, style.positionX, style.positionY]);
 
   // Get text styles
   const textStyles = useMemo((): React.CSSProperties => {
@@ -124,8 +137,14 @@ export default function CaptionRenderer({ words, style, currentTime }: CaptionRe
   }
 
   return (
-    <div style={positionStyles} className="pointer-events-none z-40">
-      <div style={textStyles}>
+    <div style={positionStyles} className="pointer-events-none z-[1000]">
+      <div
+        style={{
+          ...textStyles,
+          ...(isSelected ? { pointerEvents: 'auto', cursor: 'grab' } : {}),
+        }}
+        onMouseDown={isSelected ? onDragStart : undefined}
+      >
         {visibleWords.map(({ word, index }, i) => (
           <span
             key={`${index}-${word.text}`}

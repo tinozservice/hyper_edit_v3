@@ -59,6 +59,8 @@ function db() {
       transcribe_enabled INTEGER NOT NULL DEFAULT 1,
       tts_enabled INTEGER NOT NULL DEFAULT 1,
       video_enabled INTEGER NOT NULL DEFAULT 0,
+      image_enabled INTEGER NOT NULL DEFAULT 0,
+      video_edit_enabled INTEGER NOT NULL DEFAULT 0,
       priority INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -104,6 +106,16 @@ function migrateProviderCapabilities(conn) {
   if (!columns.includes('video_enabled')) {
     conn.exec(`ALTER TABLE llm_providers ADD COLUMN video_enabled INTEGER NOT NULL DEFAULT 0`);
     console.log(`[llm-pool] Migrasi: kolom video_enabled ditambahkan`);
+  }
+  // Image generation and video editing (video-to-video) are new capabilities:
+  // default 0 so existing providers are not tried for them.
+  if (!columns.includes('image_enabled')) {
+    conn.exec(`ALTER TABLE llm_providers ADD COLUMN image_enabled INTEGER NOT NULL DEFAULT 0`);
+    console.log(`[llm-pool] Migrasi: kolom image_enabled ditambahkan`);
+  }
+  if (!columns.includes('video_edit_enabled')) {
+    conn.exec(`ALTER TABLE llm_providers ADD COLUMN video_edit_enabled INTEGER NOT NULL DEFAULT 0`);
+    console.log(`[llm-pool] Migrasi: kolom video_edit_enabled ditambahkan`);
   }
 }
 
@@ -194,6 +206,8 @@ function rowToPublic(row) {
     transcribe_enabled: Boolean(row.transcribe_enabled),
     tts_enabled: Boolean(row.tts_enabled),
     video_enabled: Boolean(row.video_enabled),
+    image_enabled: Boolean(row.image_enabled),
+    video_edit_enabled: Boolean(row.video_edit_enabled),
     priority: row.priority,
     has_api_key: Boolean(row.api_key),
     api_key_masked: maskApiKey(row.api_key),
@@ -217,6 +231,8 @@ function rowToRuntime(row) {
     transcribe_enabled: Boolean(row.transcribe_enabled),
     tts_enabled: Boolean(row.tts_enabled),
     video_enabled: Boolean(row.video_enabled),
+    image_enabled: Boolean(row.image_enabled),
+    video_edit_enabled: Boolean(row.video_edit_enabled),
     priority: row.priority,
   };
 }
@@ -237,6 +253,8 @@ function sanitizeProviderInput(input, { partial = false } = {}) {
   if (has('transcribe_enabled')) out.transcribe_enabled = input.transcribe_enabled ? 1 : 0;
   if (has('tts_enabled')) out.tts_enabled = input.tts_enabled ? 1 : 0;
   if (has('video_enabled')) out.video_enabled = input.video_enabled ? 1 : 0;
+  if (has('image_enabled')) out.image_enabled = input.image_enabled ? 1 : 0;
+  if (has('video_edit_enabled')) out.video_edit_enabled = input.video_edit_enabled ? 1 : 0;
   if (has('timeout_ms')) out.timeout_ms = Math.max(1000, Math.min(600000, parseInt(input.timeout_ms, 10) || DEFAULT_TIMEOUT_MS));
   if (has('max_retries')) out.max_retries = Math.max(0, Math.min(10, parseInt(input.max_retries, 10) || 0));
 
@@ -286,6 +304,8 @@ const PROVIDER_CAPABILITY_COLUMNS = {
   transcription: 'transcribe_enabled',
   tts: 'tts_enabled',
   video: 'video_enabled',
+  image: 'image_enabled',
+  'video-edit': 'video_edit_enabled',
 };
 
 export function getRuntimeProviders(capability = 'chat') {
@@ -307,8 +327,8 @@ export function createProvider(input) {
   const maxPriority = db().prepare(`SELECT COALESCE(MAX(priority), -1) AS m FROM llm_providers`).get().m;
   const result = db()
     .prepare(
-      `INSERT INTO llm_providers (name, base_url, api_key, model, transcribe_model, tts_model, timeout_ms, max_retries, enabled, chat_enabled, transcribe_enabled, tts_enabled, video_enabled, priority)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO llm_providers (name, base_url, api_key, model, transcribe_model, tts_model, timeout_ms, max_retries, enabled, chat_enabled, transcribe_enabled, tts_enabled, video_enabled, image_enabled, video_edit_enabled, priority)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       data.name,
@@ -324,6 +344,8 @@ export function createProvider(input) {
       data.transcribe_enabled ?? 1,
       data.tts_enabled ?? 1,
       data.video_enabled ?? 0,
+      data.image_enabled ?? 0,
+      data.video_edit_enabled ?? 0,
       maxPriority + 1
     );
   return getProviderRow(Number(result.lastInsertRowid));
@@ -348,6 +370,8 @@ export function updateProvider(id, input) {
     transcribe_enabled: data.transcribe_enabled !== undefined ? data.transcribe_enabled : existing.transcribe_enabled,
     tts_enabled: data.tts_enabled !== undefined ? data.tts_enabled : existing.tts_enabled,
     video_enabled: data.video_enabled !== undefined ? data.video_enabled : existing.video_enabled,
+    image_enabled: data.image_enabled !== undefined ? data.image_enabled : existing.image_enabled,
+    video_edit_enabled: data.video_edit_enabled !== undefined ? data.video_edit_enabled : existing.video_edit_enabled,
   };
 
   if (data.clear_api_key) next.api_key = '';
@@ -362,7 +386,7 @@ export function updateProvider(id, input) {
       `UPDATE llm_providers
        SET name = ?, base_url = ?, api_key = ?, model = ?, transcribe_model = ?, tts_model = ?,
            timeout_ms = ?, max_retries = ?, enabled = ?, chat_enabled = ?, transcribe_enabled = ?, tts_enabled = ?,
-           video_enabled = ?, updated_at = datetime('now')
+           video_enabled = ?, image_enabled = ?, video_edit_enabled = ?, updated_at = datetime('now')
        WHERE id = ?`
     )
     .run(
@@ -379,6 +403,8 @@ export function updateProvider(id, input) {
       next.transcribe_enabled,
       next.tts_enabled,
       next.video_enabled,
+      next.image_enabled,
+      next.video_edit_enabled,
       Number(id)
     );
   return getProviderRow(Number(id));
@@ -794,18 +820,21 @@ const DEFAULT_VIDEO_TIMEOUT_MS = 10 * 60 * 1000;
 export async function generateVideo({
   prompt,
   imageDataUrl,
+  inputReferences,
   duration,
   resolution,
   aspectRatio,
   generateAudio,
   kind = 'video',
   source = 'server',
+  capability = 'video',
   pollIntervalMs = DEFAULT_VIDEO_POLL_INTERVAL_MS,
   timeoutMs = DEFAULT_VIDEO_TIMEOUT_MS,
 } = {}) {
-  const providers = getRuntimeProviders('video');
+  const providers = getRuntimeProviders(capability);
   if (!providers.length) {
-    const error = new Error('No video provider enabled. Aktifkan layanan "Video" pada salah satu provider di /settings/llm.');
+    const label = capability === 'video-edit' ? 'Video Edit' : 'Video';
+    const error = new Error(`No ${label} provider enabled. Aktifkan layanan "${label}" pada salah satu provider di /settings/llm.`);
     error.code = 'video-not-configured';
     throw error;
   }
@@ -829,6 +858,14 @@ export async function generateVideo({
               frame_images: [
                 { type: 'image_url', image_url: { url: imageDataUrl }, frame_type: 'first_frame' },
               ],
+            }
+          : {}),
+        ...(Array.isArray(inputReferences) && inputReferences.length > 0
+          ? {
+              input_references: inputReferences.map((ref) => ({
+                type: ref.type,
+                [ref.type]: { url: ref.url },
+              })),
             }
           : {}),
       };
@@ -901,7 +938,131 @@ export async function generateVideo({
   }
 
   throw new Error(
-    `All ${providers.length} video provider(s) failed. Last error: ${lastError?.message || 'unknown error'}`
+    `All ${providers.length} ${capability === 'video-edit' ? 'video-edit' : 'video'} provider(s) failed. Last error: ${lastError?.message || 'unknown error'}`
+  );
+}
+
+/**
+ * Video-to-video editing / restyle through the fallback list. The source video
+ * must be a public HTTPS URL (OpenRouter rejects data URLs for video
+ * references) — `videoUrl`. Use a provider whose model supports video input
+ * (e.g. `black-forest-labs/flux-video-edit`, `runway/aleph-2`,
+ * `bytedance/seedance-2.5`).
+ */
+export async function generateVideoEdit({ prompt, videoUrl, videoDataUrl, kind = 'video-edit', ...options } = {}) {
+  const sourceUrl = videoUrl || videoDataUrl;
+  return generateVideo({
+    prompt,
+    inputReferences: sourceUrl ? [{ type: 'video_url', url: sourceUrl }] : [],
+    kind,
+    capability: 'video-edit',
+    ...options,
+  });
+}
+
+// ---------------------------------------------------------------- image
+
+const DEFAULT_IMAGE_TIMEOUT_MS = 180000;
+
+/**
+ * Image generation (text-to-image / image-to-image) through the fallback list
+ * via OpenRouter's Image API. `inputImages` are reference data/HTTP URLs for
+ * image-to-image. Returns `{ images: [{ buffer, mediaType }], ... }`.
+ */
+export async function generateImage({
+  prompt,
+  inputImages = [],
+  aspectRatio,
+  resolution,
+  outputFormat = 'png',
+  background,
+  n = 1,
+  kind = 'image',
+  source = 'server',
+  timeoutMs = DEFAULT_IMAGE_TIMEOUT_MS,
+} = {}) {
+  const providers = getRuntimeProviders('image');
+  if (!providers.length) {
+    const error = new Error('No image provider enabled. Aktifkan layanan "Image" pada salah satu provider di /settings/llm.');
+    error.code = 'image-not-configured';
+    throw error;
+  }
+
+  let lastError = null;
+
+  for (let index = 0; index < providers.length; index += 1) {
+    const provider = providers[index];
+    const startedAt = Date.now();
+
+    try {
+      const body = {
+        model: provider.model,
+        prompt,
+        ...(n ? { n } : {}),
+        ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
+        ...(resolution ? { resolution } : {}),
+        ...(outputFormat ? { output_format: outputFormat } : {}),
+        ...(background ? { background } : {}),
+        ...(Array.isArray(inputImages) && inputImages.length > 0
+          ? { input_references: inputImages.map((url) => ({ type: 'image_url', image_url: { url } })) }
+          : {}),
+      };
+
+      const res = await providerFetch(provider, '/images', {
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        timeoutMs,
+      });
+      const data = await res.json();
+      const images = (data.data || [])
+        .map((item) => ({
+          buffer: Buffer.from(item.b64_json || '', 'base64'),
+          mediaType: item.media_type || 'image/png',
+        }))
+        .filter((image) => image.buffer.length > 0);
+      if (images.length === 0) throw new Error('image provider returned no images');
+
+      const latencyMs = Date.now() - startedAt;
+      logAttempt({
+        source,
+        kind,
+        provider_id: provider.id,
+        provider_name: provider.name,
+        model: provider.model,
+        fallback_index: index,
+        attempt: 0,
+        success: 1,
+        latency_ms: latencyMs,
+        status_code: res.status,
+      });
+      return {
+        images,
+        provider: provider.name,
+        model: provider.model,
+        fallback_index: index,
+        latencyMs,
+        cost: data.usage?.cost ?? null,
+      };
+    } catch (error) {
+      lastError = error;
+      logAttempt({
+        source,
+        kind,
+        provider_id: provider.id,
+        provider_name: provider.name,
+        model: provider.model,
+        fallback_index: index,
+        attempt: 0,
+        success: 0,
+        latency_ms: Date.now() - startedAt,
+        status_code: error.status ?? null,
+        error: error.message,
+      });
+    }
+  }
+
+  throw new Error(
+    `All ${providers.length} image provider(s) failed. Last error: ${lastError?.message || 'unknown error'}`
   );
 }
 
@@ -969,6 +1130,28 @@ export async function testProvider(id, capability = 'chat') {
       model: provider.model,
       latency_ms: 0,
       error: 'Uji video tidak tersedia dari halaman (berbiaya per detik). Uji lewat DiCaprio → Animate Image.',
+    };
+  }
+
+  if (capability === 'video-edit') {
+    return {
+      ok: false,
+      capability: 'video-edit',
+      provider: provider.name,
+      model: provider.model,
+      latency_ms: 0,
+      error: 'Uji video edit tidak tersedia dari halaman (butuh video sumber & berbiaya). Uji lewat DiCaprio → Restyle.',
+    };
+  }
+
+  if (capability === 'image') {
+    return {
+      ok: false,
+      capability: 'image',
+      provider: provider.name,
+      model: provider.model,
+      latency_ms: 0,
+      error: 'Uji gambar tidak tersedia dari halaman (berbiaya per gambar). Uji lewat fitur generate image.',
     };
   }
 

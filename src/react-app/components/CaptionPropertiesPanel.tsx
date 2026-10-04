@@ -6,6 +6,9 @@ interface CaptionPropertiesPanelProps {
   captionData: CaptionData;
   onUpdateStyle: (styleUpdates: Partial<CaptionStyle>) => void;
   onUpdateText?: (text: string) => void;
+  // Text track the clip lives on (T1/T2)
+  trackId?: string;
+  onChangeTrack?: (trackId: string) => void;
   onClose: () => void;
 }
 
@@ -32,12 +35,15 @@ const POSITION_OPTIONS = [
   { value: 'top', label: 'Top' },
   { value: 'center', label: 'Center' },
   { value: 'bottom', label: 'Bottom' },
+  { value: 'custom', label: 'Custom' },
 ];
 
 export default function CaptionPropertiesPanel({
   captionData,
   onUpdateStyle,
   onUpdateText,
+  trackId,
+  onChangeTrack,
   onClose,
 }: CaptionPropertiesPanelProps) {
   const style = captionData.style;
@@ -69,9 +75,18 @@ export default function CaptionPropertiesPanel({
     onUpdateStyle({ strokeWidth: value });
   }, [onUpdateStyle]);
 
-  const handlePositionChange = useCallback((value: 'top' | 'center' | 'bottom') => {
+  const handlePositionChange = useCallback((value: CaptionStyle['position']) => {
+    // Switching to custom starts from the current X/Y (default center).
+    if (value === 'custom') {
+      onUpdateStyle({
+        position: 'custom',
+        positionX: style.positionX ?? 50,
+        positionY: style.positionY ?? 50,
+      });
+      return;
+    }
     onUpdateStyle({ position: value });
-  }, [onUpdateStyle]);
+  }, [onUpdateStyle, style.positionX, style.positionY]);
 
   const handleAnimationChange = useCallback((value: CaptionStyle['animation']) => {
     onUpdateStyle({ animation: value });
@@ -121,6 +136,26 @@ export default function CaptionPropertiesPanel({
             placeholder="Tulis teks…"
             className="w-full px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-xs text-white resize-none outline-none focus:border-zinc-500"
           />
+        </div>
+      )}
+
+      {/* Track (T1/T2) */}
+      {onChangeTrack && (
+        <div className="px-3 py-2 border-b border-zinc-800/50">
+          <label className="text-[10px] text-zinc-500 mb-1 block">Track teks</label>
+          <div className="flex gap-1">
+            {['T1', 'T2'].map((id) => (
+              <button
+                key={id}
+                onClick={() => onChangeTrack(id)}
+                className={`flex-1 px-2 py-1 text-xs rounded transition-colors ${
+                  trackId === id ? 'bg-zinc-500 text-white' : 'bg-zinc-700 text-zinc-300 hover:bg-zinc-600'
+                }`}
+              >
+                {id}
+              </button>
+            ))}
+          </div>
         </div>
       )}
 
@@ -231,12 +266,12 @@ export default function CaptionPropertiesPanel({
             <AlignCenter className="w-3.5 h-3.5 text-zinc-500" />
             <span className="text-xs font-medium text-zinc-300">Position</span>
           </div>
-          <div className="flex gap-1">
+          <div className="grid grid-cols-4 gap-1">
             {POSITION_OPTIONS.map(opt => (
               <button
                 key={opt.value}
-                onClick={() => handlePositionChange(opt.value as 'top' | 'center' | 'bottom')}
-                className={`flex-1 px-2 py-1 text-xs rounded transition-colors ${
+                onClick={() => handlePositionChange(opt.value as CaptionStyle['position'])}
+                className={`px-2 py-1 text-xs rounded transition-colors ${
                   style.position === opt.value
                     ? 'bg-zinc-500 text-white'
                     : 'bg-zinc-700 text-zinc-300 hover:bg-zinc-600'
@@ -246,6 +281,39 @@ export default function CaptionPropertiesPanel({
               </button>
             ))}
           </div>
+          {style.position === 'custom' && (
+            <div className="mt-2 space-y-2">
+              <div className="grid grid-cols-2 gap-2">
+                <label className="space-y-1">
+                  <span className="text-[10px] text-zinc-500">X (%)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={Math.round(style.positionX ?? 50)}
+                    onChange={(e) => onUpdateStyle({ positionX: Math.min(100, Math.max(0, Number(e.target.value))) })}
+                    className="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs outline-none focus:border-zinc-500"
+                  />
+                </label>
+                <label className="space-y-1">
+                  <span className="text-[10px] text-zinc-500">Y (%)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={Math.round(style.positionY ?? 50)}
+                    onChange={(e) => onUpdateStyle({ positionY: Math.min(100, Math.max(0, Number(e.target.value))) })}
+                    className="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs outline-none focus:border-zinc-500"
+                  />
+                </label>
+              </div>
+              <p className="text-[10px] text-zinc-500">
+                Atau geser langsung teks di kanvas saat klip ini terpilih.
+              </p>
+            </div>
+          )}
         </div>
 
         {/* Animation */}

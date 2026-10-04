@@ -238,9 +238,9 @@ export default function Home() {
       }
     }
 
-    // Check caption track (T1)
+    // Check text tracks (T1/T2)
     const captionClips = activeClips.filter(c =>
-      c.trackId === 'T1' &&
+      (c.trackId === 'T1' || c.trackId === 'T2') &&
       currentTime >= c.start &&
       currentTime < c.start + c.duration
     );
@@ -517,27 +517,49 @@ export default function Home() {
     saveProject();
   }, [clips, currentTime, splitClip, saveProject]);
 
-  // Handle adding text overlay: create a text clip on T1 at the playhead and
-  // select it so the properties panel opens with the text editor.
+  // Handle adding text overlay: create a text clip on T1 (or T2 when T1 is
+  // busy at the playhead) and select it so the properties panel opens.
   // Captions live on the main timeline, so leave any edit tab first.
   const handleAddText = useCallback(() => {
     if (activeTabId !== 'main') switchTimelineTab('main');
     const duration = 3;
+    const t1Busy = activeClips.some(c =>
+      c.trackId === 'T1' && currentTime >= c.start && currentTime < c.start + c.duration
+    );
+    const trackId = t1Busy ? 'T2' : 'T1';
     const clip = addCaptionClip(
       [{ text: 'Teks baru', start: 0, end: duration }],
       currentTime,
       duration,
       { animation: 'none', position: 'bottom', fontSize: 64 }
     );
+    updateClip(clip.id, { trackId });
     setSelectedClipId(clip.id);
     saveProject();
-  }, [activeTabId, switchTimelineTab, currentTime, addCaptionClip, saveProject]);
+  }, [activeTabId, switchTimelineTab, currentTime, activeClips, addCaptionClip, updateClip, saveProject]);
 
   // Update the text of the selected manual text overlay
   const handleUpdateCaptionText = useCallback((clipId: string, text: string) => {
     updateCaptionText(clipId, text);
     saveProject();
   }, [updateCaptionText, saveProject]);
+
+  // Free-position a text clip (drag on canvas): store as custom X/Y percent
+  const handleCaptionMove = useCallback((clipId: string, xPercent: number, yPercent: number) => {
+    updateCaptionStyle(clipId, {
+      position: 'custom',
+      positionX: Math.round(xPercent * 10) / 10,
+      positionY: Math.round(yPercent * 10) / 10,
+    });
+    // Debounced save — fires once after the drag settles.
+    saveProject();
+  }, [updateCaptionStyle, saveProject]);
+
+  // Move a text clip between the two text tracks
+  const handleCaptionChangeTrack = useCallback((clipId: string, trackId: string) => {
+    updateClip(clipId, { trackId });
+    saveProject();
+  }, [updateClip, saveProject]);
 
   // ---- Saved projects (Save Project / Open Project) --------------------
   const refreshProjects = useCallback(async () => {
@@ -679,7 +701,7 @@ export default function Home() {
 
   // Check if selected clip is a caption
   const selectedCaptionData = useMemo(() =>
-    selectedClip && selectedClip.trackId === 'T1' ? getCaptionData(selectedClip.id) : null,
+    selectedClip && (selectedClip.trackId === 'T1' || selectedClip.trackId === 'T2') ? getCaptionData(selectedClip.id) : null,
     [selectedClip, getCaptionData]
   );
 
@@ -1871,7 +1893,7 @@ export default function Home() {
   // ===========================================
   const clipLabel = useCallback((c: TimelineClip): string => {
     const a = assets.find(x => x.id === c.assetId);
-    const name = c.trackId === 'T1' ? 'caption' : (a?.filename ?? 'clip');
+    const name = (c.trackId === 'T1' || c.trackId === 'T2') ? 'text' : (a?.filename ?? 'clip');
     return `${c.trackId} · ${name} · ${formatTime(c.start)}–${formatTime(c.start + c.duration)}`;
   }, [assets]);
 
@@ -1937,7 +1959,7 @@ export default function Home() {
       let targets = op.target === 'none' || op.target === 'at_playhead'
         ? activeClips.filter(c => t > c.start && t < c.start + c.duration && (op.track === 'none' || c.trackId === op.track))
         : resolveDirectorTargets(op).filter(c => t > c.start && t < c.start + c.duration);
-      targets = targets.filter(c => c.trackId !== 'T1');
+      targets = targets.filter(c => c.trackId !== 'T1' && c.trackId !== 'T2');
       if (targets.length === 0) return `Nothing to split at ${formatTime(t)}.`;
       let n = 0;
       for (const c of targets) if (splitClip(c.id, t)) n++;
@@ -1981,7 +2003,7 @@ export default function Home() {
         let changed = 0;
         for (const c of targets) {
           const asset = assets.find(a => a.id === c.assetId);
-          const isImage = asset?.type === 'image' || c.trackId === 'T1';
+          const isImage = asset?.type === 'image' || c.trackId === 'T1' || c.trackId === 'T2';
           const maxOut = isImage ? Number.POSITIVE_INFINITY : (asset?.duration ?? c.outPoint);
           let inP = c.inPoint, outP = c.outPoint, start = c.start;
           if (op.operation === 'trim_start') { if (c.duration <= amount + 0.1) continue; inP += amount; start += amount; }
@@ -2263,6 +2285,8 @@ export default function Home() {
                     captionData={selectedCaptionData}
                     onUpdateStyle={(styleUpdates) => handleUpdateCaptionStyle(selectedClipId, styleUpdates)}
                     onUpdateText={(text) => handleUpdateCaptionText(selectedClipId, text)}
+                    trackId={selectedClip?.trackId}
+                    onChangeTrack={(trackId) => handleCaptionChangeTrack(selectedClipId, trackId)}
                     onClose={() => setSelectedClipId(null)}
                   />
                 ) : (
@@ -2298,6 +2322,7 @@ export default function Home() {
                 onLayerMove={handleLayerMove}
                 onLayerSelect={handleLayerSelect}
                 selectedLayerId={selectedClipId}
+                onCaptionMove={handleCaptionMove}
               />
             ) : clips.length > 0 ? (
               // Assets exist but playhead is not over any clip

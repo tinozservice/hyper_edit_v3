@@ -78,7 +78,10 @@ export interface CaptionStyle {
   backgroundColor?: string;
   strokeColor?: string;
   strokeWidth?: number;
-  position: 'bottom' | 'center' | 'top';
+  // Preset position or free placement (positionX/positionY, percent 0-100)
+  position: 'bottom' | 'center' | 'top' | 'custom';
+  positionX?: number;
+  positionY?: number;
   animation: 'none' | 'karaoke' | 'fade' | 'pop' | 'bounce' | 'typewriter';
   highlightColor?: string;
   timeOffset?: number; // Offset in seconds to adjust sync (negative = earlier, positive = later)
@@ -137,12 +140,13 @@ export function useProject() {
   const [session, setSessionInternal] = useState<SessionInfo | null>(loadSessionFromStorage);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [tracks, setTracks] = useState<Track[]>([
-    { id: 'T1', type: 'text', name: 'T1', order: 0 },   // Captions/text track (top)
-    { id: 'V3', type: 'video', name: 'V3', order: 1 },  // Top overlay
-    { id: 'V2', type: 'video', name: 'V2', order: 2 },  // Overlay
-    { id: 'V1', type: 'video', name: 'V1', order: 3 },  // Base video track
-    { id: 'A1', type: 'audio', name: 'A1', order: 4 },  // Audio track 1
-    { id: 'A2', type: 'audio', name: 'A2', order: 5 },  // Audio track 2
+    { id: 'T1', type: 'text', name: 'T1', order: 0 },   // Text track 1 (captions/primary)
+    { id: 'T2', type: 'text', name: 'T2', order: 1 },   // Text track 2 (secondary text)
+    { id: 'V3', type: 'video', name: 'V3', order: 2 },  // Top overlay
+    { id: 'V2', type: 'video', name: 'V2', order: 3 },  // Overlay
+    { id: 'V1', type: 'video', name: 'V1', order: 4 },  // Base video track
+    { id: 'A1', type: 'audio', name: 'A1', order: 5 },  // Audio track 1
+    { id: 'A2', type: 'audio', name: 'A2', order: 6 },  // Audio track 2
   ]);
   const [clips, setClips] = useState<TimelineClip[]>([]);
   const [captionData, setCaptionData] = useState<Record<string, CaptionData>>({});

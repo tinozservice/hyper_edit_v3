@@ -37,6 +37,8 @@ interface VideoPreviewProps {
   onLayerMove?: (layerId: string, x: number, y: number) => void;
   onLayerSelect?: (layerId: string) => void;
   selectedLayerId?: string | null;
+  // Caption/text drag: x/y are percentages of the canvas (0-100).
+  onCaptionMove?: (layerId: string, xPercent: number, yPercent: number) => void;
 }
 
 export interface VideoPreviewHandle {
@@ -91,6 +93,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
   onLayerMove,
   onLayerSelect,
   selectedLayerId,
+  onCaptionMove,
 }, ref) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const loadedSrcRef = useRef<string | null>(null);
@@ -98,6 +101,14 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
   const containerRef = useRef<HTMLDivElement>(null);
   const [draggingLayer, setDraggingLayer] = useState<string | null>(null);
   const [dragStart, setDragStart] = useState<{ x: number; y: number; layerX: number; layerY: number } | null>(null);
+  const [draggingCaption, setDraggingCaption] = useState<{
+    id: string;
+    startX: number;
+    startY: number;
+    startPctX: number;
+    startPctY: number;
+    rect: DOMRect;
+  } | null>(null);
 
   // Find the base video layer (V1) for audio/playback control
   const foundBaseLayer = layers.find(l => l.trackId === 'V1' && l.type === 'video');
@@ -111,13 +122,15 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [baseLayerId, baseLayerUrl]);
 
-  // Get all layers sorted by track for rendering (V1 at bottom, then V2/V3, then T1 captions on top)
+  // Get all layers sorted by track for rendering (V1 at bottom, then V2/V3, then T1/T2 text on top)
   const sortedLayers = useMemo(() => {
     const getTrackOrder = (trackId: string) => {
       if (trackId === 'V1') return 0;
       if (trackId === 'V2') return 1;
       if (trackId === 'V3') return 2;
-      if (trackId.startsWith('T')) return 10; // Text/caption tracks on top
+      if (trackId === 'T1') return 10; // Text/caption track 1
+      if (trackId === 'T2') return 11; // Text/caption track 2 (above T1)
+      if (trackId.startsWith('T')) return 11; // Other text tracks on top
       return 5; // Other tracks in between
     };
     return [...layers].sort((a, b) => getTrackOrder(a.trackId) - getTrackOrder(b.trackId));
@@ -230,6 +243,45 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
     // Select this layer
     onLayerSelect?.(layer.id);
   }, [onLayerSelect]);
+
+  // Handle mouse down on a caption/text layer: drag to place it freely
+  const handleCaptionMouseDown = useCallback((e: React.MouseEvent, layer: ClipLayer) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    onLayerSelect?.(layer.id);
+
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    setDraggingCaption({
+      id: layer.id,
+      startX: e.clientX,
+      startY: e.clientY,
+      startPctX: layer.captionStyle?.positionX ?? 50,
+      startPctY: layer.captionStyle?.positionY ?? 50,
+      rect,
+    });
+  }, [onLayerSelect]);
+
+  // Caption drag: convert pixel deltas to canvas percentages
+  useEffect(() => {
+    if (!draggingCaption) return;
+    const handleMouseMove = (e: MouseEvent) => {
+      const dx = ((e.clientX - draggingCaption.startX) / draggingCaption.rect.width) * 100;
+      const dy = ((e.clientY - draggingCaption.startY) / draggingCaption.rect.height) * 100;
+      const x = Math.min(100, Math.max(0, draggingCaption.startPctX + dx));
+      const y = Math.min(100, Math.max(0, draggingCaption.startPctY + dy));
+      onCaptionMove?.(draggingCaption.id, x, y);
+    };
+    const handleMouseUp = () => setDraggingCaption(null);
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [draggingCaption, onCaptionMove]);
 
   // Handle mouse move for dragging
   useEffect(() => {
@@ -419,6 +471,8 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
               words={layer.captionWords}
               style={layer.captionStyle}
               currentTime={layer.clipTime}
+              isSelected={isSelected}
+              onDragStart={(e) => handleCaptionMouseDown(e, layer)}
             />
           );
         }

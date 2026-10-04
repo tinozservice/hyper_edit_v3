@@ -15,6 +15,8 @@ import {
   audioTranscription,
   synthesizeSpeech,
   generateVideo,
+  generateVideoEdit,
+  generateImage,
   listProviders,
   getRuntimeProviders,
   seedFromEnvNow,
@@ -401,11 +403,12 @@ function restoreSessionFromDisk(sessionId, { allowEmpty = false } = {}) {
     let projectState = {
       tracks: [
         { id: 'T1', type: 'text', name: 'T1', order: 0 },
-        { id: 'V3', type: 'video', name: 'V3', order: 1 },
-        { id: 'V2', type: 'video', name: 'V2', order: 2 },
-        { id: 'V1', type: 'video', name: 'V1', order: 3 },
-        { id: 'A1', type: 'audio', name: 'A1', order: 4 },
-        { id: 'A2', type: 'audio', name: 'A2', order: 5 },
+        { id: 'T2', type: 'text', name: 'T2', order: 1 },
+        { id: 'V3', type: 'video', name: 'V3', order: 2 },
+        { id: 'V2', type: 'video', name: 'V2', order: 3 },
+        { id: 'V1', type: 'video', name: 'V1', order: 4 },
+        { id: 'A1', type: 'audio', name: 'A1', order: 5 },
+        { id: 'A2', type: 'audio', name: 'A2', order: 6 },
       ],
       clips: [],
       settings: { width: 1920, height: 1080, fps: 30 },
@@ -646,15 +649,16 @@ function createSession(originalName) {
   mkdirSync(assetsDir, { recursive: true });
   mkdirSync(rendersDir, { recursive: true });
 
-  // Initialize project state with all 6 tracks
+  // Initialize project state with all 7 tracks
   const projectState = {
     tracks: [
-      { id: 'T1', type: 'text', name: 'T1', order: 0 },    // Captions/text track (top)
-      { id: 'V3', type: 'video', name: 'V3', order: 1 },   // Top overlay (B-roll)
-      { id: 'V2', type: 'video', name: 'V2', order: 2 },   // Overlay (GIFs)
-      { id: 'V1', type: 'video', name: 'V1', order: 3 },   // Base video track
-      { id: 'A1', type: 'audio', name: 'A1', order: 4 },   // Audio track 1
-      { id: 'A2', type: 'audio', name: 'A2', order: 5 },   // Audio track 2
+      { id: 'T1', type: 'text', name: 'T1', order: 0 },    // Text track 1 (captions/primary)
+      { id: 'T2', type: 'text', name: 'T2', order: 1 },    // Text track 2 (secondary text)
+      { id: 'V3', type: 'video', name: 'V3', order: 2 },   // Top overlay (B-roll)
+      { id: 'V2', type: 'video', name: 'V2', order: 3 },   // Overlay (GIFs)
+      { id: 'V1', type: 'video', name: 'V1', order: 4 },   // Base video track
+      { id: 'A1', type: 'audio', name: 'A1', order: 5 },   // Audio track 1
+      { id: 'A2', type: 'audio', name: 'A2', order: 6 },   // Audio track 2
     ],
     clips: [],
     settings: {
@@ -2710,33 +2714,56 @@ function formatAssTime(seconds) {
 // we scale fontSize from the preview reference to the output height.
 function buildAssFromCaptions(clips, captions, settings) {
   const captionClips = clips
-    .filter(c => c.trackId === 'T1')
+    .filter(c => c.trackId === 'T1' || c.trackId === 'T2')
     .filter(c => captions && captions[c.id]?.words?.length)
     .sort((a, b) => a.start - b.start);
 
   if (captionClips.length === 0) return null;
-
-  // Use the first caption clip's style as the doc-wide default. v1 limitation:
-  // mixing styles per clip would require a Style entry per clip.
-  const styled = captionClips.find(c => captions[c.id]?.style);
-  const style = (styled && captions[styled.id].style) || {};
 
   // The editor's video preview pane is roughly 650px tall (h-65vh on a
   // typical desktop). The CaptionRenderer applies fontSize as raw CSS px in
   // that pane, so a 24px caption visually occupies ~3.7% of the pane height.
   // We replicate that proportion against the actual output height.
   const previewRefHeight = 650;
-  const fontPx = Math.max(8, Math.round((style.fontSize || 24) * settings.height / previewRefHeight));
-  const outlineWidth = Math.max(1, Math.round((style.strokeWidth ?? 2) * settings.height / previewRefHeight));
 
-  const fontName = (style.fontFamily || 'Arial').replace(/[,&]/g, '');
-  const primaryColor = libassColor(style.color || '#FFFFFF');
-  const outlineColor = libassColor(style.strokeColor || '#000000');
-  const alignment = captionAlignment(style.position);
-  const marginV = Math.round(settings.height * 0.08); // matches CSS `top/bottom: 8%`
-  const bold = (style.fontWeight === 'bold' || style.fontWeight === 'black') ? -1 : 0;
+  // One ASS Style per caption clip so T1/T2 (and per-clip styles) can differ.
+  const styleLines = [];
+  const events = [];
 
-  const header = [
+  captionClips.forEach((clip, index) => {
+    const data = captions[clip.id];
+    const style = data.style || {};
+    const text = data.words.map(w => w.text).join(' ').trim();
+    if (!text) return;
+
+    const fontPx = Math.max(8, Math.round((style.fontSize || 24) * settings.height / previewRefHeight));
+    const outlineWidth = Math.max(1, Math.round((style.strokeWidth ?? 2) * settings.height / previewRefHeight));
+    const fontName = (style.fontFamily || 'Arial').replace(/[,&]/g, '');
+    const primaryColor = libassColor(style.color || '#FFFFFF');
+    const outlineColor = libassColor(style.strokeColor || '#000000');
+    const alignment = captionAlignment(style.position);
+    const marginV = Math.round(settings.height * 0.08); // matches CSS `top/bottom: 8%`
+    const bold = (style.fontWeight === 'bold' || style.fontWeight === 'black') ? -1 : 0;
+    const styleName = `T${index}`;
+
+    styleLines.push(
+      `Style: ${styleName},${fontName},${fontPx},${primaryColor},&H000000FF,${outlineColor},&H00000000,${bold},0,0,0,100,100,0,0,1,${outlineWidth},0,${alignment},20,20,${marginV},1`
+    );
+
+    // Custom position: center the text at X/Y percent of the output canvas.
+    const positionOverride = style.position === 'custom'
+      ? `{\\pos(${Math.round((style.positionX ?? 50) * settings.width / 100)},${Math.round((style.positionY ?? 50) * settings.height / 100)})}`
+      : '';
+    // Escape ASS special chars: backslash and braces.
+    const escapedText = text.replace(/\\/g, '\\\\').replace(/\{/g, '\\{').replace(/\}/g, '\\}');
+    const start = formatAssTime(clip.start);
+    const end = formatAssTime(clip.start + clip.duration);
+    events.push(`Dialogue: 0,${start},${end},${styleName},,0,0,0,,${positionOverride}${escapedText}`);
+  });
+
+  if (events.length === 0) return null;
+
+  return [
     '[Script Info]',
     'Title: HyperEdit Captions',
     'ScriptType: v4.00+',
@@ -2747,32 +2774,19 @@ function buildAssFromCaptions(clips, captions, settings) {
     '',
     '[V4+ Styles]',
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-    `Style: Default,${fontName},${fontPx},${primaryColor},&H000000FF,${outlineColor},&H00000000,${bold},0,0,0,100,100,0,0,1,${outlineWidth},0,${alignment},20,20,${marginV},1`,
+    ...styleLines,
     '',
     '[Events]',
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
-  ];
-
-  const events = [];
-  for (const clip of captionClips) {
-    const data = captions[clip.id];
-    const text = data.words.map(w => w.text).join(' ').trim();
-    if (!text) continue;
-    // Escape ASS special chars: backslash and braces.
-    const escapedText = text.replace(/\\/g, '\\\\').replace(/\{/g, '\\{').replace(/\}/g, '\\}');
-    const start = formatAssTime(clip.start);
-    const end = formatAssTime(clip.start + clip.duration);
-    events.push(`Dialogue: 0,${start},${end},Default,,0,0,0,,${escapedText}`);
-  }
-
-  return events.length > 0 ? [...header, ...events].join('\n') : null;
+    ...events,
+  ].join('\n');
 }
 
 // Map our CaptionStyle.position to the libass alignment integer:
-//   bottom = 2 (bottom-center), center = 5 (middle-center), top = 8 (top-center)
+//   bottom = 2 (bottom-center), center/custom = 5 (middle-center), top = 8
 function captionAlignment(position) {
   if (position === 'top') return 8;
-  if (position === 'center') return 5;
+  if (position === 'center' || position === 'custom') return 5;
   return 2;
 }
 
@@ -2818,7 +2832,7 @@ async function handleProjectRender(req, res, sessionId) {
     // Surface clips that reference unknown assets — these would otherwise
     // be silently dropped from the export.
     for (const clip of clips) {
-      if (clip.trackId === 'T1') continue; // T1 = captions, no asset needed
+      if (clip.trackId === 'T1' || clip.trackId === 'T2') continue; // text tracks have no asset
       if (!clip.assetId) continue;
       const asset = session.assets.get(clip.assetId);
       if (!asset) {
@@ -5801,9 +5815,10 @@ async function handleGenerateImage(req, res, sessionId) {
   }
 
   const falApiKey = process.env.FAL_KEY || process.env.FAL_API_KEY;
-  if (!falApiKey) {
+  const usePoolImage = poolHasCapability('image');
+  if (!falApiKey && !usePoolImage) {
     res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-    res.end(JSON.stringify({ error: 'FAL_KEY or FAL_API_KEY not configured in .dev.vars' }));
+    res.end(JSON.stringify({ error: 'No image provider configured. Aktifkan layanan "Image" di /settings/llm atau set FAL_API_KEY di .dev.vars.' }));
     return;
   }
 
@@ -5813,7 +5828,9 @@ async function handleGenerateImage(req, res, sessionId) {
       prompt,
       aspectRatio = '16:9',
       resolution = '1K',
-      numImages = 1
+      numImages = 1,
+      referenceAssetIds = [],
+      background,
     } = body;
 
     if (!prompt) {
@@ -5825,7 +5842,7 @@ async function handleGenerateImage(req, res, sessionId) {
     const jobId = sessionId.substring(0, 8);
     console.log(`\n[${jobId}] === PICASSO: GENERATE IMAGE ===`);
     console.log(`[${jobId}] User prompt: ${prompt}`);
-    console.log(`[${jobId}] Aspect ratio: ${aspectRatio}, Resolution: ${resolution}`);
+    console.log(`[${jobId}] Aspect ratio: ${aspectRatio}, Resolution: ${resolution}${referenceAssetIds?.length ? `, references: ${referenceAssetIds.length}` : ''}`);
 
     // Enhance prompt using the LLM fallback pool for better image generation results
     let enhancedPrompt = prompt;
@@ -5887,44 +5904,77 @@ Enhanced: "Ancient moss-covered forest with towering redwood trees, ethereal mor
       console.log(`[${jobId}] No LLM provider configured, using original prompt`);
     }
 
-    // Call fal.ai nano-banana-pro API with enhanced prompt
-    console.log(`[${jobId}] Sending to fal.ai...`);
-    const falResult = await fal.run('fal-ai/nano-banana-pro', {
-      input: {
+    // Generate images: fallback pool first (text-to-image / image-to-image),
+    // fal.ai only when the pool has no Image provider and a FAL key is set.
+    let imageResults = [];
+    let usedProvider = '';
+    if (usePoolImage) {
+      const inputImages = [];
+      for (const refId of (Array.isArray(referenceAssetIds) ? referenceAssetIds : [])) {
+        const refAsset = session.assets.get(refId);
+        if (refAsset?.type === 'image' && existsSync(refAsset.path)) {
+          const refBuffer = readFileSync(refAsset.path);
+          const refMime = refAsset.filename.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
+          inputImages.push(`data:${refMime};base64,${refBuffer.toString('base64')}`);
+        }
+      }
+      console.log(`[${jobId}] Generating via the LLM fallback pool${inputImages.length ? ` (image-to-image, ${inputImages.length} ref)` : ' (text-to-image)'}...`);
+      const result = await generateImage({
         prompt: enhancedPrompt,
-        num_images: Math.min(numImages, 4),
-        aspect_ratio: aspectRatio,
+        inputImages,
+        aspectRatio,
         resolution,
-        output_format: 'png',
-      },
-    });
-    console.log(`[${jobId}] Generated ${falResult.data?.images?.length || 0} images`);
+        outputFormat: 'png',
+        ...(background ? { background } : {}),
+        n: Math.min(numImages, 4),
+        kind: inputImages.length ? 'image-to-image' : 'text-to-image',
+        source: 'picasso',
+      });
+      imageResults = result.images.map((image) => ({ buffer: image.buffer, mediaType: image.mediaType }));
+      usedProvider = `${result.provider} (${result.model})`;
+      console.log(
+        `[${jobId}] Pool generated ${imageResults.length} image(s) in ${(result.latencyMs / 1000).toFixed(1)}s` +
+          (result.cost != null ? ` · $${Number(result.cost).toFixed(3)}` : '')
+      );
+    } else {
+      // Call fal.ai nano-banana-pro API with enhanced prompt
+      console.log(`[${jobId}] Sending to fal.ai...`);
+      const falResult = await fal.run('fal-ai/nano-banana-pro', {
+        input: {
+          prompt: enhancedPrompt,
+          num_images: Math.min(numImages, 4),
+          aspect_ratio: aspectRatio,
+          resolution,
+          output_format: 'png',
+        },
+      });
+      console.log(`[${jobId}] Generated ${falResult.data?.images?.length || 0} images`);
 
-    // SDK returns { data, requestId }
-    const images = falResult.data?.images;
-    if (!images || images.length === 0) {
-      throw new Error('No images generated');
+      const images = falResult.data?.images;
+      if (!images || images.length === 0) {
+        throw new Error('No images generated');
+      }
+      for (const imageData of images) {
+        const imageResponse = await fetch(imageData.url);
+        if (!imageResponse.ok) {
+          throw new Error(`Failed to download image: ${imageResponse.status}`);
+        }
+        imageResults.push({ buffer: Buffer.from(await imageResponse.arrayBuffer()), mediaType: 'image/png' });
+      }
+      usedProvider = 'fal.ai (nano-banana-pro)';
     }
 
-    // Download and save each generated image as an asset
+    // Save each generated image as an asset
     const generatedAssets = [];
 
-    for (let i = 0; i < images.length; i++) {
-      const imageData = images[i];
+    for (let i = 0; i < imageResults.length; i++) {
+      const imageData = imageResults[i];
       const imageId = randomUUID();
       const imagePath = join(session.assetsDir, `${imageId}.png`);
       const thumbPath = join(session.assetsDir, `${imageId}_thumb.jpg`);
 
-      console.log(`[${jobId}] Downloading image ${i + 1}...`);
-
-      // Download image
-      const imageResponse = await fetch(imageData.url);
-      if (!imageResponse.ok) {
-        throw new Error(`Failed to download image: ${imageResponse.status}`);
-      }
-
-      const buffer = await imageResponse.arrayBuffer();
-      writeFileSync(imagePath, Buffer.from(buffer));
+      console.log(`[${jobId}] Saving image ${i + 1}...`);
+      writeFileSync(imagePath, imageData.buffer);
 
       // Generate thumbnail
       try {
@@ -5940,6 +5990,7 @@ Enhanced: "Ancient moss-covered forest with towering redwood trees, ethereal mor
 
       const { stat } = await import('fs/promises');
       const stats = await stat(imagePath);
+      const info = await getMediaInfo(imagePath);
 
       // Create short filename from prompt
       const shortPrompt = prompt.substring(0, 30).replace(/[^a-zA-Z0-9\s]/g, '').replace(/\s+/g, '-');
@@ -5952,8 +6003,8 @@ Enhanced: "Ancient moss-covered forest with towering redwood trees, ethereal mor
         thumbPath: existsSync(thumbPath) ? thumbPath : null,
         duration: 5, // Default 5 seconds for images on timeline
         size: stats.size,
-        width: imageData.width || 1024,
-        height: imageData.height || 1024,
+        width: info.width || 1024,
+        height: info.height || 1024,
         createdAt: Date.now(),
         aiGenerated: true,
         generatedBy: 'picasso',
@@ -5974,14 +6025,13 @@ Enhanced: "Ancient moss-covered forest with towering redwood trees, ethereal mor
       console.log(`[${jobId}] Saved image: ${asset.filename} (${(stats.size / 1024).toFixed(1)} KB)`);
     }
 
-    saveAssetMetadata(session); // Persist asset metadata to disk
     console.log(`[${jobId}] === PICASSO COMPLETE ===\n`);
 
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({
       success: true,
       images: generatedAssets,
-      description: falResult.description,
+      provider: usedProvider,
     }));
 
   } catch (error) {
@@ -6018,24 +6068,24 @@ async function handleGenerateVideo(req, res, sessionId) {
       return;
     }
 
-    if (!imageAssetId) {
-      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      res.end(JSON.stringify({ error: 'imageAssetId is required' }));
-      return;
-    }
-
-    // Get the source image asset
-    const imageAsset = session.assets.get(imageAssetId);
-    if (!imageAsset || imageAsset.type !== 'image') {
+    // Image is optional: without one this is text-to-video (pool only; fal
+    // Kling needs a source image).
+    const imageAsset = imageAssetId ? session.assets.get(imageAssetId) : null;
+    if (imageAssetId && (!imageAsset || imageAsset.type !== 'image')) {
       res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify({ error: 'Image asset not found' }));
+      return;
+    }
+    if (!imageAsset && !usePoolVideo) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'imageAssetId is required (fal.ai Kling needs a source image; add a Video provider for text-to-video).' }));
       return;
     }
 
     const jobId = sessionId.substring(0, 8);
     console.log(`\n[${jobId}] === DICAPRIO: GENERATE VIDEO ===`);
     console.log(`[${jobId}] User prompt: ${prompt}`);
-    console.log(`[${jobId}] Source image: ${imageAsset.filename}`);
+    console.log(`[${jobId}] Source image: ${imageAsset ? imageAsset.filename : '(none — text-to-video)'}`);
     console.log(`[${jobId}] Duration: ${duration}s`);
 
     // Enhance prompt through the LLM fallback pool for better video generation
@@ -6084,21 +6134,21 @@ Output: "Epic reveal shot with slow cinematic zoom out, camera gently pulling ba
     }
 
     // Read the source image once; the pool path sends it as a data URL and the
-    // fal path uploads it to fal storage.
-    const imageBuffer = readFileSync(imageAsset.path);
-    const mimeType = imageAsset.filename.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
+    // fal path uploads it to fal storage. Text-to-video has no image.
+    const imageBuffer = imageAsset ? readFileSync(imageAsset.path) : null;
+    const mimeType = imageAsset && imageAsset.filename.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
 
     let videoBuffer;
     if (usePoolVideo) {
-      console.log(`[${jobId}] Generating video via the LLM fallback pool...`);
-      const imageDataUrl = `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
+      const imageDataUrl = imageAsset ? `data:${mimeType};base64,${imageBuffer.toString('base64')}` : undefined;
+      console.log(`[${jobId}] Generating ${imageAsset ? 'image-to-video' : 'text-to-video'} via the LLM fallback pool...`);
       const result = await generateVideo({
         prompt: enhancedPrompt,
-        imageDataUrl,
+        ...(imageDataUrl ? { imageDataUrl } : {}),
         duration,
         resolution: resolution || '768p',
         aspectRatio: aspectRatio || '16:9',
-        kind: 'image-to-video',
+        kind: imageAsset ? 'image-to-video' : 'text-to-video',
         source: 'dicaprio',
       });
       videoBuffer = result.buffer;
@@ -6255,7 +6305,53 @@ Output: "Epic reveal shot with slow cinematic zoom out, camera gently pulling ba
   }
 }
 
-// Restyle video using LTX-2 video-to-video (DiCaprio agent)
+// OpenRouter requires HTTPS URLs for video references (data URLs are rejected)
+// and its Files API does not accept video uploads. For video-to-video, upload
+// the compressed proxy to a temporary public host for the duration of the job.
+async function uploadVideoForEdit(buffer, filename) {
+  const attempts = [
+    {
+      name: 'litterbox (1 jam)',
+      run: async () => {
+        const form = new FormData();
+        form.append('reqtype', 'fileupload');
+        form.append('time', '1h');
+        form.append('fileToUpload', new Blob([buffer], { type: 'video/mp4' }), filename);
+        const res = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', { method: 'POST', body: form });
+        const text = (await res.text()).trim();
+        if (!/^https:\/\//.test(text)) throw new Error(text.slice(0, 120));
+        return text;
+      },
+    },
+    {
+      name: 'uguu.se',
+      run: async () => {
+        const form = new FormData();
+        form.append('files[]', new Blob([buffer], { type: 'video/mp4' }), filename);
+        const res = await fetch('https://uguu.se/upload?output=text', { method: 'POST', body: form });
+        const text = (await res.text()).trim();
+        if (!/^https:\/\//.test(text)) throw new Error(text.slice(0, 120));
+        return text;
+      },
+    },
+  ];
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      const url = await attempt.run();
+      console.log(`[Media] Proxy video diunggah sementara ke ${attempt.name}: ${url}`);
+      return url;
+    } catch (error) {
+      lastError = error;
+      console.warn(`[Media] Upload proxy ke ${attempt.name} gagal: ${error.message}`);
+    }
+  }
+  throw new Error(`Gagal mengunggah proxy video ke host sementara: ${lastError?.message || 'unknown error'}`);
+}
+
+// Restyle video: video-to-video through the LLM fallback pool (Video Edit
+// providers, e.g. black-forest-labs/flux-video-edit); fal.ai LTX-2 fallback.
 async function handleRestyleVideo(req, res, sessionId) {
   const session = getSession(sessionId);
   if (!session) {
@@ -6265,13 +6361,12 @@ async function handleRestyleVideo(req, res, sessionId) {
   }
 
   const falApiKey = process.env.FAL_KEY || process.env.FAL_API_KEY;
-  if (!falApiKey) {
+  const usePoolVideoEdit = poolHasCapability('video-edit');
+  if (!falApiKey && !usePoolVideoEdit) {
     res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-    res.end(JSON.stringify({ error: 'FAL_KEY or FAL_API_KEY not configured in .dev.vars' }));
+    res.end(JSON.stringify({ error: 'No video-edit provider configured. Aktifkan layanan "Video Edit" di /settings/llm atau set FAL_API_KEY di .dev.vars.' }));
     return;
   }
-
-  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
 
   try {
     const body = await parseBody(req);
@@ -6302,18 +6397,18 @@ async function handleRestyleVideo(req, res, sessionId) {
     console.log(`[${jobId}] User prompt: ${prompt}`);
     console.log(`[${jobId}] Source video: ${videoAsset.filename}`);
 
-    // Enhance prompt using Claude for better style transfer
+    // Enhance prompt through the fallback pool for better style transfer
     let enhancedPrompt = prompt;
-    if (anthropicApiKey) {
+    if (poolHasCapability('chat') || process.env.GEMINI_API_KEY) {
       try {
         console.log(`[${jobId}] Enhancing style prompt with AI...`);
 
-        const result = await callLLM(
-          anthropicApiKey,
-          'You are an expert at writing prompts for AI video style transfer. Transform the user\'s simple style request into a detailed, cinematic prompt that will produce stunning results. Include color grading and mood, texture and grain quality, lighting style, overall aesthetic, and any specific visual effects. Return ONLY the enhanced prompt, no explanations.',
-          `User request: "${prompt}"`,
-          800
-        );
+        const result = await generateText({
+          system: 'You are an expert at writing prompts for AI video style transfer. Transform the user\'s simple style request into a detailed, cinematic prompt that will produce stunning results. Include color grading and mood, texture and grain quality, lighting style, overall aesthetic, and any specific visual effects. Return ONLY the enhanced prompt, no explanations.',
+          prompt: `User request: "${prompt}"`,
+          maxTokens: 800,
+          kind: 'video-restyle-prompt',
+        });
         enhancedPrompt = result.trim();
         console.log(`[${jobId}] Enhanced prompt: ${enhancedPrompt.substring(0, 100)}...`);
       } catch (e) {
@@ -6321,73 +6416,107 @@ async function handleRestyleVideo(req, res, sessionId) {
       }
     }
 
-    // Compress video for upload (fal.ai has size limits)
-    const compressedPath = join(TEMP_DIR, `${jobId}-compressed.mp4`);
-    console.log(`[${jobId}] Compressing video for upload...`);
+    let outputBuffer;
+    if (usePoolVideoEdit) {
+      // The source video travels as a base64 data URL in input_references, so
+      // compress it to a small proxy first (480p, 8s, no audio).
+      const proxyPath = join(TEMP_DIR, `${jobId}-v2v-proxy.mp4`);
+      console.log(`[${jobId}] Compressing video for the fallback pool...`);
+      await runFFmpeg([
+        '-y', '-i', videoAsset.path,
+        '-vf', 'scale=-2:480',
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '30',
+        '-an',
+        '-t', '8',
+        proxyPath
+      ], jobId);
 
-    // Compress to 720p max, lower bitrate for faster upload
-    await runFFmpeg([
-      '-y', '-i', videoAsset.path,
-      '-vf', 'scale=-2:720',  // Max 720p height, maintain aspect
-      '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '28',  // Lower quality but smaller file
-      '-c:a', 'aac',
-      '-b:a', '128k',
-      '-t', '10',  // Max 10 seconds for API limits
-      compressedPath
-    ], jobId);
+      const proxyBuffer = readFileSync(proxyPath);
+      try { unlinkSync(proxyPath); } catch (e) { /* ignore */ }
+      const proxyMB = proxyBuffer.length / (1024 * 1024);
+      console.log(`[${jobId}] Proxy size: ${proxyMB.toFixed(1)} MB`);
+      if (proxyMB > 60) {
+        throw new Error(`Video proxy terlalu besar (${proxyMB.toFixed(1)} MB). Potong videonya atau set FAL_API_KEY sebagai fallback.`);
+      }
 
-    // Upload compressed video to fal.ai storage
-    console.log(`[${jobId}] Uploading compressed video to fal.ai storage...`);
-    const videoBuffer = readFileSync(compressedPath);
-    const fileSizeMB = videoBuffer.length / (1024 * 1024);
-    console.log(`[${jobId}] Compressed size: ${fileSizeMB.toFixed(1)} MB`);
-
-    const videoBlob = new Blob([videoBuffer], { type: 'video/mp4' });
-    const uploadedVideoUrl = await fal.storage.upload(videoBlob);
-    console.log(`[${jobId}] Video uploaded: ${uploadedVideoUrl.substring(0, 50)}...`);
-
-    // Clean up compressed file
-    try { unlinkSync(compressedPath); } catch (e) {}
-
-    console.log(`[${jobId}] Calling fal.ai LTX-2 video-to-video...`);
-
-    // Use fal.ai SDK with automatic queue handling
-    const falResult = await fal.subscribe('fal-ai/ltx-2-19b/video-to-video', {
-      input: {
+      // OpenRouter only accepts HTTPS URLs for video references, so host the
+      // proxy on a temporary public uploader for the duration of the job.
+      const videoUrl = await uploadVideoForEdit(proxyBuffer, `${jobId}-v2v.mp4`);
+      console.log(`[${jobId}] Restyling via the LLM fallback pool (Video Edit)...`);
+      const result = await generateVideoEdit({
         prompt: enhancedPrompt,
-        video_url: uploadedVideoUrl,
-        num_inference_steps: 40,
-        guidance_scale: 3,
-        video_strength: 0.7,
-        generate_audio: false,
-        video_quality: 'high',
-      },
-      logs: true,
-      onQueueUpdate: (update) => {
-        if (update.status === 'IN_QUEUE') {
-          console.log(`[${jobId}] Queued at position ${update.position || '?'}`);
-        } else if (update.status === 'IN_PROGRESS') {
-          console.log(`[${jobId}] Processing...`);
-        }
-      },
-    });
+        videoUrl,
+        kind: 'video-edit',
+        source: 'dicaprio',
+      });
+      outputBuffer = result.buffer;
+      console.log(
+        `[${jobId}] Restyle via ${result.provider} (${result.model}) in ${(result.latencyMs / 1000).toFixed(1)}s` +
+          (result.cost != null ? ` · $${Number(result.cost).toFixed(3)}` : '')
+      );
+    } else {
+      // Compress video for upload (fal.ai has size limits)
+      const compressedPath = join(TEMP_DIR, `${jobId}-compressed.mp4`);
+      console.log(`[${jobId}] Compressing video for fal.ai...`);
 
-    console.log(`[${jobId}] Video restyle complete!`);
+      await runFFmpeg([
+        '-y', '-i', videoAsset.path,
+        '-vf', 'scale=-2:720',
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '28',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-t', '10',
+        compressedPath
+      ], jobId);
 
-    // Download the restyled video - SDK returns { data, requestId }
-    const outputVideoUrl = falResult.data?.video?.url;
-    if (!outputVideoUrl) {
-      throw new Error('No video URL in response');
+      console.log(`[${jobId}] Uploading compressed video to fal.ai storage...`);
+      const videoBuffer = readFileSync(compressedPath);
+      const fileSizeMB = videoBuffer.length / (1024 * 1024);
+      console.log(`[${jobId}] Compressed size: ${fileSizeMB.toFixed(1)} MB`);
+
+      const videoBlob = new Blob([videoBuffer], { type: 'video/mp4' });
+      const uploadedVideoUrl = await fal.storage.upload(videoBlob);
+      console.log(`[${jobId}] Video uploaded: ${uploadedVideoUrl.substring(0, 50)}...`);
+
+      try { unlinkSync(compressedPath); } catch (e) { /* ignore */ }
+
+      console.log(`[${jobId}] Calling fal.ai LTX-2 video-to-video...`);
+      const falResult = await fal.subscribe('fal-ai/ltx-2-19b/video-to-video', {
+        input: {
+          prompt: enhancedPrompt,
+          video_url: uploadedVideoUrl,
+          num_inference_steps: 40,
+          guidance_scale: 3,
+          video_strength: 0.7,
+          generate_audio: false,
+          video_quality: 'high',
+        },
+        logs: true,
+        onQueueUpdate: (update) => {
+          if (update.status === 'IN_QUEUE') {
+            console.log(`[${jobId}] Queued at position ${update.position || '?'}`);
+          } else if (update.status === 'IN_PROGRESS') {
+            console.log(`[${jobId}] Processing...`);
+          }
+        },
+      });
+
+      console.log(`[${jobId}] Video restyle complete!`);
+      const outputVideoUrl = falResult.data?.video?.url;
+      if (!outputVideoUrl) {
+        throw new Error('No video URL in response');
+      }
+
+      const videoResponse = await fetch(outputVideoUrl);
+      if (!videoResponse.ok) {
+        throw new Error('Failed to download restyled video');
+      }
+      outputBuffer = Buffer.from(await videoResponse.arrayBuffer());
     }
-
-    const videoResponse = await fetch(outputVideoUrl);
-    if (!videoResponse.ok) {
-      throw new Error('Failed to download restyled video');
-    }
-
-    const outputBuffer = Buffer.from(await videoResponse.arrayBuffer());
 
     // Save to assets
     const newVideoId = randomUUID();
@@ -6397,31 +6526,46 @@ async function handleRestyleVideo(req, res, sessionId) {
 
     writeFileSync(outputPath, outputBuffer);
 
-    // Generate thumbnail
-    await runFFmpeg([
-      '-y', '-i', outputPath,
-      '-vf', 'scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2',
-      '-frames:v', '1',
-      thumbPath
-    ], jobId);
+    // Generate thumbnail (best-effort)
+    try {
+      await runFFmpeg([
+        '-y', '-i', outputPath,
+        '-vf', 'scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2',
+        '-frames:v', '1',
+        thumbPath
+      ], jobId);
+    } catch (thumbError) {
+      console.warn(`[${jobId}] Thumbnail generation failed: ${thumbError.message}`);
+    }
 
-    // Get video duration
+    // Probe duration + dimensions of the restyled video
     let videoDuration = videoAsset.duration || 5;
+    let videoWidth = videoAsset.width || 1280;
+    let videoHeight = videoAsset.height || 720;
     try {
       const probeResult = await new Promise((resolve) => {
-        const proc = spawn('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', outputPath]);
+        const proc = spawn('ffprobe', ['-v', 'error', '-show_entries', 'format=duration:stream=width,height', '-of', 'json', outputPath]);
         let output = '';
         proc.stdout.on('data', d => output += d.toString());
         proc.on('close', code => {
           if (code === 0) {
-            try { resolve(parseFloat(JSON.parse(output).format.duration)); }
-            catch { resolve(videoDuration); }
-          } else resolve(videoDuration);
+            try {
+              const data = JSON.parse(output);
+              const stream = data.streams?.[0] || {};
+              resolve({
+                duration: parseFloat(data.format?.duration) || videoDuration,
+                width: parseInt(stream.width, 10) || videoWidth,
+                height: parseInt(stream.height, 10) || videoHeight,
+              });
+            } catch { resolve({ duration: videoDuration, width: videoWidth, height: videoHeight }); }
+          } else resolve({ duration: videoDuration, width: videoWidth, height: videoHeight });
         });
-        proc.on('error', () => resolve(videoDuration));
+        proc.on('error', () => resolve({ duration: videoDuration, width: videoWidth, height: videoHeight }));
       });
-      videoDuration = probeResult;
-    } catch (e) { /* use default */ }
+      videoDuration = probeResult.duration;
+      videoWidth = probeResult.width;
+      videoHeight = probeResult.height;
+    } catch (e) { /* use defaults */ }
 
     const { stat } = await import('fs/promises');
     const stats = await stat(outputPath);
@@ -6435,8 +6579,8 @@ async function handleRestyleVideo(req, res, sessionId) {
       thumbPath: existsSync(thumbPath) ? thumbPath : null,
       size: stats.size,
       duration: videoDuration,
-      width: falResult.video?.width || 1280,
-      height: falResult.video?.height || 720,
+      width: videoWidth,
+      height: videoHeight,
       uploadedAt: Date.now(),
       generatedBy: 'dicaprio-restyle',
       sourcePrompt: prompt,
@@ -6468,7 +6612,8 @@ async function handleRestyleVideo(req, res, sessionId) {
   }
 }
 
-// Remove video background using Bria (DiCaprio agent)
+// Remove video background with a local chroma key (green/blue screen) using
+// FFmpeg — no fal.ai needed. Output is a WebM (VP9 + alpha channel).
 async function handleRemoveVideoBg(req, res, sessionId) {
   const session = getSession(sessionId);
   if (!session) {
@@ -6477,16 +6622,15 @@ async function handleRemoveVideoBg(req, res, sessionId) {
     return;
   }
 
-  const falApiKey = process.env.FAL_KEY || process.env.FAL_API_KEY;
-  if (!falApiKey) {
-    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-    res.end(JSON.stringify({ error: 'FAL_KEY or FAL_API_KEY not configured in .dev.vars' }));
-    return;
-  }
-
   try {
     const body = await parseBody(req);
-    const { videoAssetId } = body;
+    const {
+      videoAssetId,
+      keyColor = 'green',   // 'green' | 'blue' | '#RRGGBB'
+      similarity = 0.35,    // 0.01–1, how close a pixel must be to the key color
+      blend = 0.15,         // 0–1, edge softness
+      despill = true,       // remove the key color bleeding from edges
+    } = body;
 
     if (!videoAssetId) {
       res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
@@ -6503,87 +6647,57 @@ async function handleRemoveVideoBg(req, res, sessionId) {
     }
 
     const jobId = sessionId.substring(0, 8);
-    console.log(`\n[${jobId}] === DICAPRIO: REMOVE VIDEO BACKGROUND ===`);
+    console.log(`\n[${jobId}] === DICAPRIO: REMOVE VIDEO BACKGROUND (CHROMA KEY) ===`);
     console.log(`[${jobId}] Source video: ${videoAsset.filename}`);
 
-    // Compress video for upload (fal.ai has size limits)
-    const compressedPath = join(TEMP_DIR, `${jobId}-bg-compressed.mp4`);
-    console.log(`[${jobId}] Compressing video for upload...`);
+    // Resolve the key color: 'green' (default), 'blue', or a hex color.
+    const colorHex = /^#?[0-9a-f]{6}$/i.test(String(keyColor))
+      ? `0x${String(keyColor).replace('#', '').toUpperCase()}`
+      : String(keyColor).toLowerCase() === 'blue' ? '0x0000FF' : '0x00FF00';
+    const despillType = colorHex === '0x0000FF' ? 'blue' : 'green';
+    const sim = Math.min(1, Math.max(0.01, Number(similarity) || 0.35));
+    const bl = Math.min(1, Math.max(0, Number(blend) || 0));
+    const filters = [
+      // Despill first (works on YUV), then key out the color (produces RGBA),
+      // then keep the alpha for the VP9 encoder.
+      ...(despill ? [`despill=type=${despillType}`] : []),
+      `colorkey=${colorHex}:${sim}:${bl}`,
+      'format=yuva420p',
+    ].join(',');
+    console.log(`[${jobId}] Chroma key: color=${colorHex} similarity=${sim} blend=${bl}${despill ? ` despill=${despillType}` : ''}`);
 
-    // Compress to 720p max, lower bitrate for faster upload
-    await runFFmpeg([
-      '-y', '-i', videoAsset.path,
-      '-vf', 'scale=-2:720',  // Max 720p height, maintain aspect
-      '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '28',  // Lower quality but smaller file
-      '-c:a', 'aac',
-      '-b:a', '128k',
-      '-t', '10',  // Max 10 seconds for API limits
-      compressedPath
-    ], jobId);
-
-    // Upload compressed video to fal.ai storage
-    console.log(`[${jobId}] Uploading compressed video to fal.ai storage...`);
-    const videoBuffer = readFileSync(compressedPath);
-    const fileSizeMB = videoBuffer.length / (1024 * 1024);
-    console.log(`[${jobId}] Compressed size: ${fileSizeMB.toFixed(1)} MB`);
-
-    const videoBlob = new Blob([videoBuffer], { type: 'video/mp4' });
-    const uploadedVideoUrl = await fal.storage.upload(videoBlob);
-    console.log(`[${jobId}] Video uploaded: ${uploadedVideoUrl.substring(0, 50)}...`);
-
-    // Clean up compressed file
-    try { unlinkSync(compressedPath); } catch (e) {}
-
-    console.log(`[${jobId}] Calling fal.ai Bria video background removal...`);
-
-    // Use fal.ai SDK with automatic queue handling
-    const falResult = await fal.subscribe('fal-ai/ben/v2/video', {
-      input: {
-        video_url: uploadedVideoUrl,
-        output_format: 'webm',  // WebM for transparency support
-      },
-      logs: true,
-      onQueueUpdate: (update) => {
-        if (update.status === 'IN_QUEUE') {
-          console.log(`[${jobId}] Queued at position ${update.position || '?'}`);
-        } else if (update.status === 'IN_PROGRESS') {
-          console.log(`[${jobId}] Processing...`);
-        }
-      },
-    });
-
-    console.log(`[${jobId}] Background removal complete!`);
-
-    // Download the processed video - SDK returns { data, requestId }
-    const outputVideoUrl = falResult.data?.video?.url;
-    if (!outputVideoUrl) {
-      throw new Error('No video URL in response');
-    }
-
-    const videoResponse = await fetch(outputVideoUrl);
-    if (!videoResponse.ok) {
-      throw new Error('Failed to download processed video');
-    }
-
-    const outputBuffer = Buffer.from(await videoResponse.arrayBuffer());
-
-    // Save to assets (webm for transparency support)
     const newVideoId = randomUUID();
     const baseName = videoAsset.filename.replace(/\.[^/.]+$/, '');
     const outputPath = join(session.assetsDir, `${newVideoId}.webm`);
     const thumbPath = join(session.assetsDir, `${newVideoId}_thumb.jpg`);
 
-    writeFileSync(outputPath, outputBuffer);
-
-    // Generate thumbnail
+    // VP9 + alpha keeps the transparency in a WebM the browser can preview.
     await runFFmpeg([
-      '-y', '-i', outputPath,
-      '-vf', 'scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2',
-      '-frames:v', '1',
-      thumbPath
+      '-y', '-i', videoAsset.path,
+      '-vf', filters,
+      '-c:v', 'libvpx-vp9',
+      '-pix_fmt', 'yuva420p',
+      '-auto-alt-ref', '0',
+      '-b:v', '0',
+      '-crf', '28',
+      '-c:a', 'libopus',
+      '-b:a', '128k',
+      outputPath
     ], jobId);
+
+    console.log(`[${jobId}] Background removal complete!`);
+
+    // Generate thumbnail (best-effort)
+    try {
+      await runFFmpeg([
+        '-y', '-i', outputPath,
+        '-vf', 'scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2',
+        '-frames:v', '1',
+        thumbPath
+      ], jobId);
+    } catch (thumbError) {
+      console.warn(`[${jobId}] Thumbnail generation failed: ${thumbError.message}`);
+    }
 
     // Get video duration
     let videoDuration = videoAsset.duration || 5;
@@ -8647,7 +8761,8 @@ const DIRECTOR_WORKFLOWS = {
 };
 
 const TRACK_CRITERIA = {
-  T1: 'T1, the captions / text track',
+  T1: 'T1, the first text track (captions / primary text)',
+  T2: 'T2, the second text track (secondary text, stacked above T1)',
   V3: 'V3, the top overlay track (logos, b-roll images)',
   V2: 'V2, the overlay track (animations)',
   V1: 'V1, the main / base video track',

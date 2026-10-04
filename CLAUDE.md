@@ -37,7 +37,7 @@ scripts/
 ```
 
 **Key patterns:**
-- Multi-track timeline with 6 tracks: T1 (captions), V3 (top overlay), V2 (overlay), V1 (base video), A1/A2 (audio)
+- Multi-track timeline with 7 tracks: T1/T2 (text/captions), V3 (top overlay), V2 (overlay), V1 (base video), A1/A2 (audio)
 - `useProject()` hook manages all project state: assets, clips, playback, captions, rendering
 - Local FFmpeg server (port 3333) handles sessions, asset storage, thumbnail generation, rendering, and Whisper-based transcription for captions
 - Cloudflare Worker with D1 database and R2 bucket for production (configured in wrangler.json)
@@ -189,6 +189,7 @@ This was a deliberate, scoped swap — only the free-text "what does the user wa
 ## UI Layout Conventions
 
 - **Track placement**: AI-generated animations always go on V2. B-roll images go on V3 with default `scale: 0.2`, centered.
+- **Text layers (T1/T2)**: both render above every video layer (CaptionRenderer `z-[1000]` inside the isolated canvas). A text clip's `position` is `top | center | bottom | custom`; custom stores `positionX/positionY` as canvas percentages (0-100), set via the properties panel or by dragging the text on the canvas while the clip is selected (`VideoPreview.onCaptionMove`). `handleAddText` uses T1, falling back to T2 when T1 is busy at the playhead; the properties panel can move a clip between T1 and T2. Exports burn both text tracks with one ASS style per clip (custom positions use `\pos`).
 - **Image clips** default to 5-second duration everywhere (`addClip`, `handleDropAsset`, `addCaptionClip`).
 - **Caption word timestamps** are relative to clip start, not absolute project time. Conversion happens in `getPreviewLayers()`.
 - **Caption chunking**: Max 5 words per chunk OR when there's a 0.7s pause between words (hardcoded in Home.tsx `handleTranscribeAndAddCaptions`).

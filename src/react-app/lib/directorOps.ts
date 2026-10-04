@@ -18,7 +18,7 @@ export type TimelineOperation =
   | 'clear_track'   // delete every clip on a track
   | 'none';
 
-export type TrackId = 'T1' | 'V3' | 'V2' | 'V1' | 'A1' | 'A2';
+export type TrackId = 'T1' | 'T2' | 'V3' | 'V2' | 'V1' | 'A1' | 'A2';
 export type TrackChoice = TrackId | 'none';
 export type SizePreset = 'tiny' | 'small' | 'half' | 'full' | 'none';
 export type PositionPreset = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' | 'center' | 'none';

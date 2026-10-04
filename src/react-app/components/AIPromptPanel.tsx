@@ -1177,7 +1177,7 @@ export default function AIPromptPanel({
   const routeWithJev = async (ctx: DirectorContext): Promise<{ workflow: WorkflowType; confidence: number; latencyMs: number; timelineOp: DirectorTimelineOp } | null> => {
     const timelineClips = (activeTabId !== 'main' ? editTabClips : clips).map(c => {
       const a = assets.find(x => x.id === c.assetId);
-      return { id: c.id, label: `${c.trackId} · ${c.trackId === 'T1' ? 'caption' : (a?.filename ?? 'clip')} · ${fmtTime(c.start)}–${fmtTime(c.start + c.duration)}` };
+      return { id: c.id, label: `${c.trackId} · ${c.trackId === 'T1' || c.trackId === 'T2' ? 'text' : (a?.filename ?? 'clip')} · ${fmtTime(c.start)}–${fmtTime(c.start + c.duration)}` };
     });
     const selectedLabel = selectedClipId ? timelineClips.find(c => c.id === selectedClipId)?.label ?? null : null;
     const controller = new AbortController();
