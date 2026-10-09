@@ -46,7 +46,7 @@ JEV_MODEL=typesafe/jev-1.13
 
 Dilaporkan dari panel Obsidian/JEV di Windows: banner kuning `spawn rsync ENOENT` dan 0 clips/0 images.
 
-**Penyebab:** agen media menyalin vault iCloud ke mirror lokal memakai `rsync` (tidak ada di Windows), dan path vault default menunjuk ke folder macOS milik developer asli (`/Users/<user>/...`). Keduanya membuat sync selalu gagal dan isi index kosong.
+**Penyebab:** agen media menyalin vault iCloud ke mirror lokal memakai `rsync` (tidak ada di Windows), dan path vault default menunjuk ke folder macOS pribadi (`/Users/<user>/...`). Keduanya membuat sync selalu gagal dan isi index kosong.
 
 **Perbaikan `scripts/obsidian-agent.js`:**
 - Mode **direct** otomatis saat `rsync` tidak tersedia (Windows): index, thumbnail, dan import membaca vault di tempat; `syncMirror()` menjadi no-op tanpa spawn proses.

@@ -9,7 +9,7 @@
 // exists only as the fallback when TYPESAFE_API_KEY is missing.
 //
 // Config:
-//   OBSIDIAN_VAULT_PATH  vault root (defaults to the Marketing OS Broll vault)
+//   OBSIDIAN_VAULT_PATH  vault root (defaults to ~/Documents/ObsidianVault)
 //   TYPESAFE_API_KEY     Jev — the agent's brain
 
 import { readFileSync, existsSync, readdirSync, statSync, mkdirSync } from 'fs';
@@ -18,8 +18,8 @@ import { homedir } from 'os';
 import { spawn, spawnSync } from 'child_process';
 import { askJev, jevConfigured, jevInfo, noul } from './jev.js';
 
-const DEFAULT_VAULT_PATH =
-  "/Users/<user>/Documents/Documents - My Mac (2)/Media /Marketing OS Broll/Marketing OS Broll";
+// Neutral default; set OBSIDIAN_VAULT_PATH in .dev.vars for your own vault.
+const DEFAULT_VAULT_PATH = join(homedir(), 'Documents', 'ObsidianVault');
 
 const VIDEO_EXT = new Set(['.mp4', '.mov', '.webm', '.m4v', '.mkv']);
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg']);
