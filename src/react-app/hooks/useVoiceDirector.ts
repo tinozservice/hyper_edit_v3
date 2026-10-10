@@ -34,7 +34,7 @@ function getRecognitionCtor(): SpeechRecognitionCtor | null {
 }
 
 /** Strip markdown / code so the spoken reply sounds natural. */
-export function toSpeakable(text: string, maxChars = 420): string {
+function toSpeakable(text: string, maxChars = 420): string {
   let t = text
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`[^`]*`/g, ' ')

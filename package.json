@@ -6,19 +6,14 @@
   "dependencies": {
     "@creatoros/cli": "^0.1.8",
     "@fal-ai/client": "^1.8.4",
-    "@ffmpeg/ffmpeg": "^0.12.15",
-    "@ffmpeg/util": "^0.12.2",
     "@google/genai": "^1.38.0",
-    "@hono/zod-validator": "^0.5.0",
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.5.0",
     "@remotion/animated-emoji": "^4.0.409",
-    "@remotion/bundler": "^4.0.407",
     "@remotion/gif": "4.0.409",
     "@remotion/lottie": "4.0.409",
     "@remotion/player": "^4.0.407",
     "@remotion/preload": "^4.0.409",
-    "@remotion/renderer": "^4.0.407",
     "@remotion/shapes": "^4.0.409",
     "@remotion/three": "^4.0.409",
     "@types/formidable": "^3.4.6",
@@ -32,8 +27,7 @@
     "react-dom": "19.0.0",
     "react-router": "^7.5.3",
     "remotion": "^4.0.407",
-    "three": "^0.182.0",
-    "zod": "^3.24.3"
+    "three": "^0.182.0"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.12.0",

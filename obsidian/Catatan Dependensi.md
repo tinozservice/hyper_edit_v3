@@ -1,6 +1,6 @@
 # Catatan Dependensi
 
-Diperbarui: 2026-10-02
+Diperbarui: 2026-10-10
 Terkait: [[Logs/2026-10-02 - Implementasi Fallback LLM|Log 2026-10-02]] · [[Audit Klien LLM]] · [[Panduan Fallback LLM]]
 
 ## Kebutuhan sistem
@@ -91,5 +91,5 @@ Kunci yang terisi otomatis dimasukkan ke pool fallback saat server editor pertam
 
 ## Diketahui belum beres (di luar scope permintaan ini)
 
-- **Bug Windows `spawn('npx')`** di `scripts/local-ffmpeg-server.js` (3 lokasi render Remotion) — gagal `ENOENT` di Windows; perlu `npx.cmd`/`shell: true`. Render motion graphic & animasi AI belum bisa sampai ini dipatch.
+- **Bug Windows `spawn('npx')` — SUDAH DIPATCH (2026-10-10):** `scripts/local-ffmpeg-server.js` kini memakai `spawnRemotion()` yang menjalankan `node_modules/@remotion/cli/remotion-cli.js` via `process.execPath` (baris 777) — tanpa `npx`/shell sama sekali. Render motion graphic & animasi AI bisa jalan.
 - **Agen Obsidian (Jev)** kini mendukung Windows lewat mode *direct* (tanpa rsync): vault dibaca di tempat, tanpa warning `spawn rsync ENOENT`. Agar berguna, isi `OBSIDIAN_VAULT_PATH` ke vault lokal berisi media + sidecar `.md` (format Marketing OS Broll). Tanpa itu panel menampilkan "Vault not found" — bukan error rsync.
